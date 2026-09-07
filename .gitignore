@@ -1,0 +1,55 @@
+# Python
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtualenv / tooling
+pip-log.txt
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets and local app data
+.env
+.env.*
+settings.json
+*.json.bak
+
+# Media and project working files
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+*.ogg
+.cache/
+.cache_test/
+projects/
+exports/
+tools/ffmpeg/
+
+# Keep example project JSON if we add one later
+!examples/**/*.json
