@@ -7,16 +7,16 @@ from pathlib import Path
 from app.engine.ffmpeg import audio_duration, run
 from app.engine.settings import cache_dir
 
-TTS_VOLUME = "+50%"
+TTS_VOLUME = "+100%"
 TTS_PREP_FILTER = (
     "silenceremove=start_periods=1:start_threshold=-35dB:start_silence=0.02:detection=peak,"
     "aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo,"
-    "volume=2.3,alimiter=limit=0.96,asetpts=PTS-STARTPTS"
+    "volume=4.5,alimiter=limit=0.99,asetpts=PTS-STARTPTS"
 )
 
 
 def cache_path(provider: str, voice: str, text: str, suffix: str) -> Path:
-    digest = hashlib.sha256(f"{provider}|{voice}|{text}|wav1".encode("utf-8")).hexdigest()[:20]
+    digest = hashlib.sha256(f"{provider}|{voice}|{text}|loud5".encode("utf-8")).hexdigest()[:20]
     return cache_dir() / f"{provider}_{digest}{suffix}"
 
 

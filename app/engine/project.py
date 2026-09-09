@@ -79,6 +79,7 @@ class Project:
     narrations: dict[str, Narration] = field(default_factory=dict)
     music_path: str | None = None
     music_volume: float = 0.2
+    voice_volume: float = 1.0
     music_duration: float = 0.0
     mark_in: float | None = None
     mark_out: float | None = None
@@ -115,6 +116,7 @@ class Project:
             "narrations": {code: item.to_dict() for code, item in self.narrations.items()},
             "music_path": self.music_path,
             "music_volume": self.music_volume,
+            "voice_volume": self.voice_volume,
             "music_duration": self.music_duration,
             "mark_in": self.mark_in,
             "mark_out": self.mark_out,
@@ -155,6 +157,7 @@ class Project:
             narrations=narrations,
             music_path=data.get("music_path") or None,
             music_volume=float(data.get("music_volume", 0.2)),
+            voice_volume=float(data.get("voice_volume", 1.0)),
             music_duration=float(data.get("music_duration", 0.0)),
             mark_in=data.get("mark_in"),
             mark_out=data.get("mark_out"),

@@ -89,6 +89,7 @@ class MainWindow(QMainWindow):
         self._audio_hold = False
         self._hold_at = 0.0
         self._hold_started = 0.0
+        self._joining = False
         self._music_selected = False
         self.tts_store: dict[str, tuple] = {}
         self._loading_table = False
@@ -102,6 +103,7 @@ class MainWindow(QMainWindow):
         self.narration_audio = QAudioOutput(self)
         self.narration_audio.setVolume(1.0)
         self.narration_player.setAudioOutput(self.narration_audio)
+        self._preview_audio.setVolume(1.0)
 
         self.music_player = QMediaPlayer(self)
         self.music_audio = QAudioOutput(self)
@@ -327,24 +329,34 @@ class MainWindow(QMainWindow):
         tools.addWidget(self.follow_box)
         tl_box.addLayout(tools)
 
-        music_row = QHBoxLayout()
-        music_row.setSpacing(6)
-        music_row.addWidget(QLabel("Music"))
+        mix_row = QHBoxLayout()
+        mix_row.setSpacing(6)
+        mix_row.addWidget(QLabel("Voice"))
+        self.voice_volume = QSlider(Qt.Orientation.Horizontal)
+        self.voice_volume.setRange(0, 100)
+        self.voice_volume.setValue(100)
+        self.voice_volume.setMaximumWidth(140)
+        self.voice_volume.setToolTip("Narration loudness. Tutorials default to full volume.")
+        self.voice_vol_label = QLabel("100%")
+        mix_row.addWidget(self.voice_volume)
+        mix_row.addWidget(self.voice_vol_label)
+        mix_row.addSpacing(12)
+        mix_row.addWidget(QLabel("Music"))
         self.music_volume = QSlider(Qt.Orientation.Horizontal)
         self.music_volume.setRange(0, 100)
         self.music_volume.setValue(20)
-        self.music_volume.setMaximumWidth(180)
+        self.music_volume.setMaximumWidth(140)
         self.music_volume.setToolTip("Background soundtrack level")
         self.music_vol_label = QLabel("20%")
         self.music_name_label = QLabel("No soundtrack")
         self.music_name_label.setObjectName("hintLabel")
-        music_row.addWidget(self.music_volume)
-        music_row.addWidget(self.music_vol_label)
-        music_row.addWidget(self.music_name_label, 1)
+        mix_row.addWidget(self.music_volume)
+        mix_row.addWidget(self.music_vol_label)
+        mix_row.addWidget(self.music_name_label, 1)
         self.selected_label = QLabel("No clip selected")
         self.selected_label.setObjectName("hintLabel")
-        music_row.addWidget(self.selected_label)
-        tl_box.addLayout(music_row)
+        mix_row.addWidget(self.selected_label)
+        tl_box.addLayout(mix_row)
         self.timeline = TimelineWidget()
         self.timeline.setToolTip(
             "Mark In / Mark Out / Delete In→Out to cut the middle. "
@@ -371,6 +383,7 @@ class MainWindow(QMainWindow):
         self.play_btn.clicked.connect(self.toggle_play)
         self.player.positionChanged.connect(self._on_position)
         self.player.playbackStateChanged.connect(self._on_play_state)
+        self.player.mediaStatusChanged.connect(self._video_status)
         self.slider.sliderPressed.connect(self._slider_pressed)
         self.slider.sliderReleased.connect(self._seek_from_slider)
         self.slider.sliderMoved.connect(self._slider_scrub)
@@ -396,6 +409,7 @@ class MainWindow(QMainWindow):
         self.zoom_out_btn.clicked.connect(lambda: self.timeline.zoom_by(0.8))
         self.fit_btn.clicked.connect(self.timeline.fit_zoom)
         self.follow_box.toggled.connect(self._follow_changed)
+        self.voice_volume.valueChanged.connect(self._voice_volume_changed)
         self.music_volume.valueChanged.connect(self._music_volume_changed)
         self.timeline.musicSelected.connect(self._music_track_selected)
         self.mute_box.toggled.connect(self._mute_changed)
@@ -635,6 +649,21 @@ class MainWindow(QMainWindow):
     def _follow_changed(self, checked: bool) -> None:
         self.timeline.follow_playhead = checked
 
+    def _voice_gain(self) -> float:
+        return max(0.0, min(1.0, float(getattr(self.project, "voice_volume", 1.0))))
+
+    def _apply_voice_volume(self) -> None:
+        gain = self._voice_gain()
+        self.narration_audio.setMuted(False)
+        self.narration_audio.setVolume(gain)
+        self._preview_audio.setMuted(False)
+        self._preview_audio.setVolume(gain)
+
+    def _voice_volume_changed(self, value: int) -> None:
+        self.project.voice_volume = value / 100.0
+        self.voice_vol_label.setText(f"{value}%")
+        self._apply_voice_volume()
+
     def _music_volume_changed(self, value: int) -> None:
         self.project.music_volume = value / 100.0
         self.music_vol_label.setText(f"{value}%")
@@ -650,6 +679,11 @@ class MainWindow(QMainWindow):
         self.music_volume.blockSignals(False)
         self.music_vol_label.setText(f"{self.music_volume.value()}%")
         self.music_audio.setVolume(self.project.music_volume)
+        self.voice_volume.blockSignals(True)
+        self.voice_volume.setValue(int(round(self._voice_gain() * 100)))
+        self.voice_volume.blockSignals(False)
+        self.voice_vol_label.setText(f"{self.voice_volume.value()}%")
+        self._apply_voice_volume()
 
     def refresh_all(self) -> None:
         self.mute_box.setChecked(self.project.mute_original)
@@ -800,20 +834,28 @@ class MainWindow(QMainWindow):
         self._seeking = False
         self._seek_target_ms = None
 
-    def _begin_seek(self, local_ms: int) -> None:
+    def _begin_seek(self, local_ms: int, lock_ms: int = 400) -> None:
         self._seeking = True
         self._seek_target_ms = local_ms
-        self._seek_unlock.start(400)
+        self._seek_unlock.start(max(80, lock_ms))
 
-    def _show_current_media(self, force: bool = False) -> None:
-        mapped = map_joined_to_clip(self.project.clips, self.playhead)
-        if not mapped:
+    def _show_current_media(self, force: bool = False, playback_join: bool = False) -> None:
+        if not self.project.clips:
             self.player.stop()
             self.preview_stack.setCurrentWidget(self.image_label)
             self.image_label.setText("Add a video or image to the timeline")
             self.image_label.setPixmap(QPixmap())
             return
-        clip, local, index = mapped
+        index = self.selected_index
+        if index < 0 or index >= len(self.project.clips):
+            mapped = map_joined_to_clip(self.project.clips, self.playhead)
+            if not mapped:
+                return
+            _, _, index = mapped
+        clip = self.project.clips[index]
+        start = clip_joined_start(self.project.clips, index)
+        local = clip.in_point + max(0.0, self.playhead - start)
+        local = min(clip.out_point, local)
         self.selected_index = index
         if clip.is_image:
             self.player.pause()
@@ -835,11 +877,12 @@ class MainWindow(QMainWindow):
         url = QUrl.fromLocalFile(str(Path(clip.path).resolve()))
         target_ms = int(local * 1000)
         if self.player.source() != url:
-            self._begin_seek(target_ms)
+            self._begin_seek(target_ms, 250 if playback_join else 400)
             self.player.setSource(url)
             self.player.setPosition(target_ms)
         elif force or abs(self.player.position() - target_ms) > 80:
-            self._begin_seek(target_ms)
+            if not playback_join:
+                self._begin_seek(target_ms)
             self.player.setPosition(target_ms)
         self._apply_mute()
         if self._playing and not self._scrubbing and not self._audio_hold:
@@ -956,6 +999,9 @@ class MainWindow(QMainWindow):
             return
         if self.playhead >= joined_duration(self.project.clips) - 0.05:
             self.playhead = 0.0
+        mapped = map_joined_to_clip(self.project.clips, self.playhead)
+        if mapped:
+            self.selected_index = mapped[2]
         self._playing = True
         self.play_btn.setText("Pause")
         self._apply_mute()
@@ -968,6 +1014,7 @@ class MainWindow(QMainWindow):
     def _pause_all(self) -> None:
         self._playing = False
         self._audio_hold = False
+        self._joining = False
         self.play_btn.setText("Play")
         self.player.pause()
         self.narration_player.pause()
@@ -1004,9 +1051,72 @@ class MainWindow(QMainWindow):
     def _on_play_state(self, state) -> None:
         if not self._playing:
             self.play_btn.setText("Play")
+            return
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self._joining = False
+            return
+        if self._audio_hold or self._scrubbing or self._joining or self._seeking:
+            return
+        QTimer.singleShot(0, self._continue_playback)
+
+    def _video_status(self, status) -> None:
+        if (
+            status == QMediaPlayer.MediaStatus.EndOfMedia
+            and self._playing
+            and not self._audio_hold
+            and not self._scrubbing
+        ):
+            QTimer.singleShot(0, self._play_next_clip)
+
+    def _play_next_clip(self) -> None:
+        if not self._playing or self._audio_hold or self._scrubbing:
+            return
+        nxt = self.selected_index + 1
+        if nxt >= len(self.project.clips):
+            self.playhead = joined_duration(self.project.clips)
+            self._pause_all()
+            self._refresh_transport()
+            return
+        self.selected_index = nxt
+        self.playhead = clip_joined_start(self.project.clips, nxt)
+        self._joining = True
+        self._show_current_media(force=True, playback_join=True)
+        self._start_clock_if_needed()
+        self.refresh_timeline()
+        self._refresh_transport()
+        self._sync_narration()
+        self._sync_music()
+        clip = self.current_clip()
+        if clip and not clip.is_image and not self._audio_hold:
+            self.player.play()
+        QTimer.singleShot(80, self._clear_joining)
+
+    def _clear_joining(self) -> None:
+        self._joining = False
+        if self._playing and not self._audio_hold and not self._scrubbing:
+            clip = self.current_clip()
+            if clip and not clip.is_image:
+                if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                    self.player.play()
+
+    def _continue_playback(self) -> None:
+        if not self._playing or self._audio_hold or self._scrubbing or self._joining:
+            return
+        clip = self.current_clip()
+        if not clip:
+            self._pause_all()
+            return
+        local = self.player.position() / 1000.0
+        if not clip.is_image and local >= clip.out_point - 0.05:
+            self._play_next_clip()
+            return
+        if clip.is_image:
+            self._start_clock_if_needed()
+            return
+        self.player.play()
 
     def _on_position(self, position: int) -> None:
-        if self._slider_dragging or self._scrubbing or self._audio_hold:
+        if self._slider_dragging or self._scrubbing or self._audio_hold or self._joining:
             return
         if self._seeking:
             target = self._seek_target_ms
@@ -1022,24 +1132,8 @@ class MainWindow(QMainWindow):
         local = position / 1000.0
         if local < clip.in_point - 0.05:
             return
-        if local >= clip.out_point - 0.04:
-            next_index = self.selected_index + 1
-            if next_index < len(self.project.clips):
-                self.playhead = clip_joined_start(self.project.clips, next_index)
-                self.selected_index = next_index
-                self._show_current_media(force=True)
-                self._start_clock_if_needed()
-                if self._playing:
-                    nxt = self.current_clip()
-                    if nxt and not nxt.is_image:
-                        self.player.play()
-            else:
-                self.playhead = joined_duration(self.project.clips)
-                self._pause_all()
-            self._refresh_transport()
-            self.refresh_timeline()
-            self._sync_narration()
-            self._sync_music()
+        if local >= clip.out_point - 0.03:
+            self._play_next_clip()
             return
         self.playhead = clip_joined_start(self.project.clips, self.selected_index) + (
             local - clip.in_point
@@ -1191,8 +1285,8 @@ class MainWindow(QMainWindow):
         self._apply_narration_pending()
 
     def _sync_narration(self, force: bool = False) -> None:
-        self.narration_audio.setVolume(1.0)
         self.narration_audio.setMuted(False)
+        self._apply_voice_volume()
         if not self.plan or len(self.tts_paths) != len(self.plan.cues):
             self._stop_narration()
             return
@@ -1578,6 +1672,7 @@ class MainWindow(QMainWindow):
 
     def _play_preview_file(self, path) -> None:
         self.preview_voice_btn.setEnabled(True)
+        self._apply_voice_volume()
         self._preview_player.setSource(QUrl.fromLocalFile(str(Path(path).resolve())))
         self._preview_player.play()
         self._set_status("Playing voice preview.")

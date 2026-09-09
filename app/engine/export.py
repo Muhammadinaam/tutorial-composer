@@ -235,6 +235,7 @@ def mix_tts(
     keep_original_audio: bool = False,
     music_path: str | None = None,
     music_volume: float = 0.2,
+    voice_volume: float = 1.0,
 ) -> Path:
     info = media_info(video)
     duration = max(float(info["duration"]), 0.1)
@@ -271,13 +272,14 @@ def mix_tts(
         audio_labels.append(f"[{label}]")
         next_index += 1
 
+    gain = max(0.0, min(4.0, float(voice_volume) * 2.8))
     for delay_sec, path in tts_items:
         inputs.extend(["-i", str(path)])
         delay_ms = max(0, int(round(delay_sec * 1000)))
         label = f"t{next_index}"
         filters.append(
             f"[{next_index}:a]aresample=44100,aformat=channel_layouts=stereo,"
-            f"volume=1.6,adelay={delay_ms}:all=1[{label}]"
+            f"volume={gain:.3f},alimiter=limit=0.99,adelay={delay_ms}:all=1[{label}]"
         )
         audio_labels.append(f"[{label}]")
         next_index += 1
@@ -338,5 +340,6 @@ def export_project(
         keep_original_audio=not project.mute_original,
         music_path=project.music_path,
         music_volume=project.music_volume,
+        voice_volume=getattr(project, "voice_volume", 1.0),
     )
     return dest

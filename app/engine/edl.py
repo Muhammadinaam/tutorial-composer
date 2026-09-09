@@ -57,14 +57,16 @@ def map_joined_to_clip(clips: list[Clip], joined_time: float) -> tuple[Clip, flo
     if not clips:
         return None
     acc = 0.0
+    last_index = len(clips) - 1
     for index, clip in enumerate(clips):
-        if acc + clip.used >= joined_time or index == len(clips) - 1:
+        clip_end = acc + clip.used
+        if joined_time < clip_end - 0.0005 or index == last_index:
             local = clip.in_point + max(0.0, joined_time - acc)
             local = min(clip.out_point, local)
             return clip, local, index
-        acc += clip.used
+        acc = clip_end
     last = clips[-1]
-    return last, last.out_point, len(clips) - 1
+    return last, last.out_point, last_index
 
 
 def clip_joined_start(clips: list[Clip], index: int) -> float:
