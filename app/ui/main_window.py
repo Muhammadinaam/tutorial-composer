@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSlider,
     QSplitter,
@@ -89,6 +90,10 @@ class MainWindow(QMainWindow):
         self._audio_hold = False
         self._hold_at = 0.0
         self._hold_started = 0.0
+        self._video_frozen = False
+        self._freeze_index = -1
+        self._freeze_clock = 0.0
+        self._music_lead = 0.0
         self._joining = False
         self._music_selected = False
         self.tts_store: dict[str, tuple] = {}
@@ -118,6 +123,9 @@ class MainWindow(QMainWindow):
         self._narration_retry = QTimer(self)
         self._narration_retry.setSingleShot(True)
         self._narration_retry.timeout.connect(self._retry_narration)
+        self._freeze_timer = QTimer(self)
+        self._freeze_timer.setSingleShot(True)
+        self._freeze_timer.timeout.connect(self._freeze_timeout)
 
         self._build_menu()
         self._build_ui()
@@ -253,10 +261,16 @@ class MainWindow(QMainWindow):
         tab_row.addWidget(self.lang_tabs, 1)
         tab_row.addWidget(add_lang_btn)
         script_box.addLayout(tab_row)
-        self.cue_table = QTableWidget(0, 2)
-        self.cue_table.setHorizontalHeaderLabels(["Time", "Text"])
+        self.cue_table = QTableWidget(0, 3)
+        self.cue_table.setHorizontalHeaderLabels(["Time", "Text", "Stop video"])
         self.cue_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.cue_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.cue_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        stop_header = self.cue_table.horizontalHeaderItem(2)
+        if stop_header:
+            stop_header.setToolTip(
+                "When checked, the picture freezes while this line is spoken (preview and export)."
+            )
         self.cue_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.cue_table.verticalHeader().setVisible(False)
         self.cue_table.verticalHeader().setDefaultSectionSize(22)
@@ -372,9 +386,18 @@ class MainWindow(QMainWindow):
         bottom.setSpacing(8)
         self.export_btn = QPushButton("Export MP4")
         self.export_btn.setObjectName("accentButton")
+        self.export_progress = QProgressBar()
+        self.export_progress.setRange(0, 100)
+        self.export_progress.setValue(0)
+        self.export_progress.setTextVisible(True)
+        self.export_progress.setFormat("%p%")
+        self.export_progress.setMaximumWidth(240)
+        self.export_progress.setFixedHeight(18)
+        self.export_progress.setVisible(False)
         self.status_label = QLabel("Add a video to the timeline to begin.")
         self.status_label.setObjectName("hintLabel")
         bottom.addWidget(self.export_btn)
+        bottom.addWidget(self.export_progress)
         bottom.addWidget(self.status_label, 1)
         outer.addLayout(bottom)
         self.statusBar().showMessage("Ready")
@@ -466,26 +489,41 @@ class MainWindow(QMainWindow):
     def _busy(self) -> bool:
         return self.worker is not None and self.worker.isRunning()
 
-    def _start_worker(self, fn, on_ok) -> None:
+    def _start_worker(self, fn, on_ok, *, progress_bar: bool = False) -> None:
         if self._busy():
             self.statusBar().showMessage("Please wait for the current task to finish.")
             return
         self.worker = TaskWorker(fn, self)
         self.worker.progress.connect(self._set_status)
+        self.worker.percent.connect(self._set_export_percent)
         self.worker.succeeded.connect(on_ok)
         self.worker.failed.connect(self._task_failed)
         self.worker.finished.connect(self._worker_done)
+        if progress_bar:
+            self.export_progress.setValue(0)
+            self.export_progress.setVisible(True)
         self.worker.start()
+
+    def _set_export_percent(self, value: int) -> None:
+        if not self.export_progress.isVisible():
+            return
+        self.export_progress.setValue(max(0, min(100, int(value))))
+
+    def _hide_export_progress(self) -> None:
+        self.export_progress.setVisible(False)
+        self.export_progress.setValue(0)
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
         self.statusBar().showMessage(text)
 
     def _task_failed(self, message: str) -> None:
+        self._hide_export_progress()
         self._set_status("Something went wrong.")
         QMessageBox.critical(self, "Error", message)
 
     def _worker_done(self) -> None:
+        self._hide_export_progress()
         self.generate_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
         self.translate_btn.setEnabled(True)
@@ -603,10 +641,13 @@ class MainWindow(QMainWindow):
 
     def _cue_spans(self) -> list[tuple[float, float, str]]:
         if self.plan and self.plan.cues:
-            return [
-                (c.video_time, max(0.4, c.tts_duration), c.text[:42] or "Cue")
-                for c in self.plan.cues
-            ]
+            spans = []
+            for cue in self.plan.cues:
+                label = cue.text[:42] or "Cue"
+                if cue.should_video_stop:
+                    label = f"Freeze · {label}"
+                spans.append((cue.video_time, max(0.4, cue.tts_duration), label))
+            return spans
         cues = self._spoken_cues()
         spans = []
         durations = (
@@ -615,7 +656,10 @@ class MainWindow(QMainWindow):
             else [estimate_speech_seconds(c.text) for c in cues]
         )
         for cue, duration in zip(cues, durations):
-            spans.append((cue.video_time, max(0.4, duration), cue.text[:42] or "Cue"))
+            label = cue.text[:42] or "Cue"
+            if cue.should_video_stop:
+                label = f"Freeze · {label}"
+            spans.append((cue.video_time, max(0.4, duration), label))
         return spans
 
     def _restore_tts(self) -> None:
@@ -645,6 +689,7 @@ class MainWindow(QMainWindow):
             self._narration_pending = None
             self._narration_gen += 1
             self._audio_hold = False
+            self._discard_video_freeze()
 
     def _follow_changed(self, checked: bool) -> None:
         self.timeline.follow_playhead = checked
@@ -781,6 +826,8 @@ class MainWindow(QMainWindow):
             self._reset_narration_player()
             self.music_player.pause()
         self._audio_hold = False
+        self._discard_video_freeze()
+        self._music_lead = 0.0
         self._scrubbing = True
         self._seek_joined(seconds, keep_playing=False, live=True)
 
@@ -818,7 +865,7 @@ class MainWindow(QMainWindow):
             self._sync_music(force=True)
         if live:
             self.timeline.follow_playhead = following
-        if keep_playing and not self._audio_hold:
+        if keep_playing and self._video_should_run():
             self._start_clock_if_needed()
             if self._playing:
                 clip = self.current_clip()
@@ -885,7 +932,7 @@ class MainWindow(QMainWindow):
                 self._begin_seek(target_ms)
             self.player.setPosition(target_ms)
         self._apply_mute()
-        if self._playing and not self._scrubbing and not self._audio_hold:
+        if self._video_should_run():
             self.player.play()
 
     def add_videos(self) -> None:
@@ -1005,16 +1052,21 @@ class MainWindow(QMainWindow):
         self._playing = True
         self.play_btn.setText("Pause")
         self._apply_mute()
+        due = self._cue_index_at(self.playhead, lead=self.NARRATION_LEAD)
+        if due is not None and self._cue_wants_stop(due):
+            self._begin_video_freeze(due)
         self._show_current_media(force=False)
         self._sync_narration(force=True)
         self._sync_music(force=True)
-        if not self._audio_hold:
+        if self._video_should_run():
             self._resume_transport()
 
     def _pause_all(self) -> None:
         self._playing = False
         self._audio_hold = False
         self._joining = False
+        self._discard_video_freeze()
+        self._music_lead = 0.0
         self.play_btn.setText("Play")
         self.player.pause()
         self.narration_player.pause()
@@ -1030,7 +1082,7 @@ class MainWindow(QMainWindow):
             self._image_clock.stop()
 
     def _tick_image(self) -> None:
-        if not self._playing or self._audio_hold:
+        if not self._playing or self._audio_hold or self._video_frozen:
             return
         self.playhead += 0.033
         total = joined_duration(self.project.clips)
@@ -1055,7 +1107,7 @@ class MainWindow(QMainWindow):
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self._joining = False
             return
-        if self._audio_hold or self._scrubbing or self._joining or self._seeking:
+        if self._audio_hold or self._video_frozen or self._scrubbing or self._joining or self._seeking:
             return
         QTimer.singleShot(0, self._continue_playback)
 
@@ -1064,12 +1116,13 @@ class MainWindow(QMainWindow):
             status == QMediaPlayer.MediaStatus.EndOfMedia
             and self._playing
             and not self._audio_hold
+            and not self._video_frozen
             and not self._scrubbing
         ):
             QTimer.singleShot(0, self._play_next_clip)
 
     def _play_next_clip(self) -> None:
-        if not self._playing or self._audio_hold or self._scrubbing:
+        if not self._playing or self._audio_hold or self._video_frozen or self._scrubbing:
             return
         nxt = self.selected_index + 1
         if nxt >= len(self.project.clips):
@@ -1087,20 +1140,20 @@ class MainWindow(QMainWindow):
         self._sync_narration()
         self._sync_music()
         clip = self.current_clip()
-        if clip and not clip.is_image and not self._audio_hold:
+        if clip and not clip.is_image and self._video_should_run():
             self.player.play()
         QTimer.singleShot(80, self._clear_joining)
 
     def _clear_joining(self) -> None:
         self._joining = False
-        if self._playing and not self._audio_hold and not self._scrubbing:
+        if self._playing and self._video_should_run():
             clip = self.current_clip()
             if clip and not clip.is_image:
                 if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
                     self.player.play()
 
     def _continue_playback(self) -> None:
-        if not self._playing or self._audio_hold or self._scrubbing or self._joining:
+        if not self._playing or self._audio_hold or self._video_frozen or self._scrubbing or self._joining:
             return
         clip = self.current_clip()
         if not clip:
@@ -1116,7 +1169,7 @@ class MainWindow(QMainWindow):
         self.player.play()
 
     def _on_position(self, position: int) -> None:
-        if self._slider_dragging or self._scrubbing or self._audio_hold or self._joining:
+        if self._slider_dragging or self._scrubbing or self._audio_hold or self._video_frozen or self._joining:
             return
         if self._seeking:
             target = self._seek_target_ms
@@ -1148,9 +1201,13 @@ class MainWindow(QMainWindow):
         self._reset_narration_player()
         self.music_player.pause()
         self._audio_hold = False
+        self._discard_video_freeze()
+        self._music_lead = 0.0
 
     def _slider_scrub(self, value: int) -> None:
         self._audio_hold = False
+        self._discard_video_freeze()
+        self._music_lead = 0.0
         self._scrubbing = True
         self._seek_joined(value / 1000.0, keep_playing=False, live=True)
 
@@ -1207,6 +1264,8 @@ class MainWindow(QMainWindow):
         self._slider_dragging = False
         self._scrubbing = False
         self._audio_hold = False
+        self._discard_video_freeze()
+        self._music_lead = 0.0
         self._reset_narration_player()
         total = joined_duration(self.project.clips)
         self.playhead = min(max(0.0, seconds), max(0.0, total))
@@ -1220,11 +1279,69 @@ class MainWindow(QMainWindow):
             self.player.pause()
             self.music_player.pause()
             self._sync_narration(force=True)
-            if not self._audio_hold:
+            if self._video_should_run():
                 self._resume_transport()
         else:
             self.player.pause()
             self._sync_narration(force=True)
+
+    def _video_should_run(self) -> bool:
+        return (
+            self._playing
+            and not self._scrubbing
+            and not self._audio_hold
+            and not self._video_frozen
+        )
+
+    def _cue_wants_stop(self, index: int) -> bool:
+        if not self.plan or index < 0 or index >= len(self.plan.cues):
+            return False
+        return bool(self.plan.cues[index].should_video_stop)
+
+    def _discard_video_freeze(self) -> None:
+        self._video_frozen = False
+        self._freeze_index = -1
+        self._freeze_clock = 0.0
+        self._freeze_timer.stop()
+
+    def _begin_video_freeze(self, index: int) -> None:
+        if self._video_frozen and self._freeze_index == index:
+            return
+        if self._video_frozen and self._freeze_clock:
+            self._music_lead += max(0.0, monotonic() - self._freeze_clock)
+        self._video_frozen = True
+        self._freeze_index = index
+        self._freeze_clock = monotonic()
+        duration = 0.0
+        if self.plan and 0 <= index < len(self.plan.cues):
+            cue = self.plan.cues[index]
+            duration = cue.tts_duration
+            self.playhead = cue.video_time
+        self.player.pause()
+        self._image_clock.stop()
+        self._refresh_transport()
+        self._freeze_timer.start(int(max(0.5, duration + 0.6) * 1000))
+
+    def _end_video_freeze(self, resume: bool = True) -> None:
+        if not self._video_frozen:
+            self._freeze_timer.stop()
+            return
+        if self._freeze_clock:
+            self._music_lead += max(0.0, monotonic() - self._freeze_clock)
+        self._discard_video_freeze()
+        if resume and self._playing and not self._scrubbing and not self._audio_hold:
+            self._resume_transport()
+
+    def _freeze_timeout(self) -> None:
+        if not self._video_frozen:
+            return
+        if self.narration_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._freeze_timer.start(400)
+            return
+        if self._narration_index >= 0:
+            self._narration_finished = self._narration_index
+            self._narration_index = -1
+        self._end_video_freeze(resume=True)
 
     def _hold_transport(self, at: float) -> None:
         self._audio_hold = True
@@ -1242,6 +1359,11 @@ class MainWindow(QMainWindow):
         self._audio_hold = False
         if not self._playing:
             return
+        if self._video_frozen:
+            self.player.pause()
+            self._image_clock.stop()
+            self._sync_music()
+            return
         self._show_current_media(force=False)
         self._start_clock_if_needed()
         clip = self.current_clip()
@@ -1257,6 +1379,8 @@ class MainWindow(QMainWindow):
         self._narration_pending = None
         if self._audio_hold and not self._scrubbing:
             self._resume_transport()
+        elif self._video_frozen:
+            self._end_video_freeze(resume=True)
 
     def _needs_reload(self, url: QUrl) -> bool:
         status = self.narration_player.mediaStatus()
@@ -1317,6 +1441,10 @@ class MainWindow(QMainWindow):
             return
         offset = max(0.0, self.playhead - self.plan.cues[due].video_time)
         start_at = offset if force and offset > 0.05 else 0.0
+        if self._cue_wants_stop(due):
+            self._begin_video_freeze(due)
+        elif self._video_frozen:
+            self._end_video_freeze(resume=False)
         if self.narration_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
             self._hold_transport(self.playhead)
         self._start_narration(due, start_at, True)
@@ -1380,10 +1508,13 @@ class MainWindow(QMainWindow):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
             if self._narration_index >= 0:
                 self._narration_finished = self._narration_index
+            finished = self._narration_index
             self._narration_index = -1
             self._narration_pending = None
             if self._audio_hold:
                 self._resume_transport()
+            elif self._video_frozen and (self._freeze_index == finished or finished < 0):
+                self._end_video_freeze(resume=True)
             return
         if status in self._LOADED:
             self._apply_narration_pending()
@@ -1406,7 +1537,15 @@ class MainWindow(QMainWindow):
             self.music_player.setSource(url)
             force = True
         length = self.project.music_duration or 0.0
-        offset = self.playhead % length if length > 0.05 else self.playhead
+        moment = self.playhead + self._music_lead
+        if self._video_frozen and self._freeze_clock:
+            moment += max(0.0, monotonic() - self._freeze_clock)
+        offset = moment % length if length > 0.05 else moment
+        if self._video_frozen and not force:
+            self.music_audio.setVolume(self.project.music_volume)
+            if self._playing:
+                self._ensure_playing(self.music_player)
+            return
         drifted = abs(self.music_player.position() / 1000.0 - offset) > 1.5
         if force or drifted:
             self.music_player.setPosition(int(offset * 1000))
@@ -1432,7 +1571,11 @@ class MainWindow(QMainWindow):
                 moment = parse_timestamp(raw_time or "0")
             except ValueError:
                 continue
-            cues.append(Cue(video_time=moment, text=text))
+            stop_item = self.cue_table.item(row, 2)
+            stop = bool(
+                stop_item and stop_item.checkState() == Qt.CheckState.Checked
+            )
+            cues.append(Cue(video_time=moment, text=text, should_video_stop=stop))
         cues.sort(key=lambda c: c.video_time)
         return cues
 
@@ -1441,14 +1584,38 @@ class MainWindow(QMainWindow):
         cues = self.project.current().cues
         self.cue_table.setRowCount(0)
         for cue in cues:
-            self._append_cue_row(format_timestamp(cue.video_time), cue.text)
+            self._append_cue_row(
+                format_timestamp(cue.video_time),
+                cue.text,
+                cue.should_video_stop,
+            )
         self._loading_table = False
 
-    def _append_cue_row(self, time_text: str, body: str) -> None:
+    def _append_cue_row(self, time_text: str, body: str, stop: bool = False) -> None:
         row = self.cue_table.rowCount()
         self.cue_table.insertRow(row)
         self.cue_table.setItem(row, 0, QTableWidgetItem(time_text))
         self.cue_table.setItem(row, 1, QTableWidgetItem(body))
+        stop_item = QTableWidgetItem()
+        stop_item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsUserCheckable
+            | Qt.ItemFlag.ItemIsSelectable
+        )
+        stop_item.setCheckState(
+            Qt.CheckState.Checked if stop else Qt.CheckState.Unchecked
+        )
+        stop_item.setToolTip("Freeze the picture while this line is spoken.")
+        self.cue_table.setItem(row, 2, stop_item)
+
+    def _rebuild_plan_from_tts(self) -> None:
+        cues = self._spoken_cues()
+        if not cues or len(self.tts_durations) != len(cues):
+            return
+        self.plan = build_timeline(
+            cues, self.tts_durations, joined_duration(self.project.clips)
+        )
+        self._save_tts()
 
     def _table_changed(self, *_args) -> None:
         if self._loading_table:
@@ -1456,12 +1623,16 @@ class MainWindow(QMainWindow):
         cues = self._cues_from_table()
         spoken = [c for c in cues if c.text.strip()]
         current = self.project.current()
-        before = [(c.video_time, c.text) for c in current.cues if c.text.strip()]
-        after = [(c.video_time, c.text) for c in spoken]
+        before = [(c.video_time, c.text, c.should_video_stop) for c in current.cues if c.text.strip()]
+        after = [(c.video_time, c.text, c.should_video_stop) for c in spoken]
         current.cues = spoken
         self.project.cues = spoken
-        if before != after:
+        before_words = [(t, text) for t, text, _stop in before]
+        after_words = [(t, text) for t, text, _stop in after]
+        if before_words != after_words:
             self._clear_tts(self.project.lang)
+        elif before != after:
+            self._rebuild_plan_from_tts()
         self._warn_timer.start()
         self.refresh_timeline()
 
@@ -1638,13 +1809,19 @@ class MainWindow(QMainWindow):
                 "Some times are after the video ends — those lines will not play. "
                 f"Video is {format_timestamp(source)}."
             )
-        holds = [c for c in plan.cues if c.hold > 0.05]
+        holds = [c for c in plan.cues if (not c.should_video_stop) and c.hold > 0.05]
+        stops = [c for c in plan.cues if c.should_video_stop and c.tts_duration > 0.05]
+        if stops:
+            bits.extend(
+                f"{format_timestamp(c.video_time)}: video stops for {c.tts_duration:.1f}s while this line is spoken"
+                for c in stops
+            )
         if holds:
             bits.extend(
                 f"{format_timestamp(c.video_time)}: speech {c.tts_duration:.1f}s > gap {c.gap:.1f}s → hold {c.hold:.1f}s"
                 for c in holds
             )
-        elif not late:
+        elif not late and not stops:
             kind = "measured" if len(self.tts_durations) == len(cues) else "estimated"
             bits.append(f"No holds ({kind}). Speech fits the gaps.")
         if self.tts_paths and len(self.tts_paths) == len(cues):
@@ -1815,14 +1992,17 @@ class MainWindow(QMainWindow):
         source = joined_duration(self.project.clips)
         existing_paths = list(self.tts_paths)
         existing_durs = list(self.tts_durations)
+        need_tts = bool(cues) and (len(existing_paths) != len(cues) or len(existing_durs) != len(cues))
 
         def work(progress):
             paths = existing_paths
             durations = existing_durs
-            if cues and (len(paths) != len(cues) or len(durations) != len(cues)):
+            voice_end = 18 if need_tts else 0
+            if need_tts:
                 paths, durations = [], []
                 for i, cue in enumerate(cues, start=1):
-                    progress(f"Speaking cue {i} of {len(cues)}...")
+                    pct = int((i - 1) / max(1, len(cues)) * voice_end)
+                    progress(f"Speaking cue {i} of {len(cues)}...", pct)
                     path, duration = synthesize_with_duration(
                         cue.text,
                         provider=data.get("tts_provider", "edge-tts"),
@@ -1832,18 +2012,30 @@ class MainWindow(QMainWindow):
                     )
                     paths.append(path)
                     durations.append(duration)
+                progress("Voices ready. Rendering video…", voice_end)
             plan = build_timeline(cues, durations, source) if cues else build_timeline([], [], source)
-            progress("Rendering video with FFmpeg...")
-            export_project(self.project, plan, paths, dest, cache_dir() / "export")
+            progress("Rendering video with FFmpeg...", voice_end)
+            export_project(
+                self.project,
+                plan,
+                paths,
+                dest,
+                cache_dir() / "export",
+                progress=progress,
+                percent_start=voice_end,
+                percent_end=99,
+            )
+            progress("Finishing export…", 100)
             return dest, paths, durations, plan
 
         self.export_btn.setEnabled(False)
-        self._start_worker(work, self._export_done)
+        self._start_worker(work, self._export_done, progress_bar=True)
 
     def _export_done(self, result) -> None:
         dest, paths, durations, plan = result
         self.tts_paths, self.tts_durations, self.plan = paths, durations, plan
         self.export_btn.setEnabled(True)
+        self._hide_export_progress()
         self.refresh_warnings()
         self._set_status(f"Exported {dest}")
         QMessageBox.information(self, "Export complete", f"Saved:\n{dest}")

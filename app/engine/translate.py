@@ -66,5 +66,11 @@ def translate_cues(cues: list[Cue], target_lang: str, api_key: str) -> list[Cue]
     translated = []
     for index, cue in enumerate(cues):
         text = by_index.get(index) or cue.text
-        translated.append(Cue(video_time=cue.video_time, text=text))
+        translated.append(
+            Cue(
+                video_time=cue.video_time,
+                text=text,
+                should_video_stop=cue.should_video_stop,
+            )
+        )
     return translated

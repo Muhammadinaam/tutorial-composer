@@ -225,6 +225,20 @@ QStatusBar {
     border-top: 1px solid #2b2d31;
 }
 
+QProgressBar {
+    background-color: #2b2d31;
+    border: 1px solid #3a3c42;
+    border-radius: 4px;
+    text-align: center;
+    color: #f0f0f0;
+    min-width: 160px;
+}
+
+QProgressBar::chunk {
+    background-color: #3d8fd1;
+    border-radius: 3px;
+}
+
 QSplitter::handle {
     background-color: #1e1f22;
     width: 5px;

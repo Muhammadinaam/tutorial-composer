@@ -43,6 +43,15 @@ class Clip:
 class Cue:
     video_time: float
     text: str
+    should_video_stop: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Cue:
+        return cls(
+            video_time=float(data.get("video_time", 0.0)),
+            text=str(data.get("text", "")),
+            should_video_stop=bool(data.get("should_video_stop", False)),
+        )
 
 
 @dataclass
@@ -60,7 +69,7 @@ class Narration:
 
     @classmethod
     def from_dict(cls, data: dict) -> Narration:
-        cues = [Cue(**c) for c in data.get("cues", [])]
+        cues = [Cue.from_dict(c) if isinstance(c, dict) else c for c in data.get("cues", [])]
         return cls(
             lang=data.get("lang", "en"),
             voice=data.get("voice", "en-US-JennyNeural"),
@@ -129,7 +138,7 @@ class Project:
             item = dict(raw)
             item.setdefault("kind", "image" if _looks_image(item.get("path", "")) else "video")
             clips.append(Clip(**item))
-        cues = [Cue(**c) for c in data.get("cues", [])]
+        cues = [Cue.from_dict(c) if isinstance(c, dict) else c for c in data.get("cues", [])]
         narrations = {}
         raw_nars = data.get("narrations") or {}
         for code, payload in raw_nars.items():

@@ -3,8 +3,8 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from app.engine.edl import target_video_size
-from app.engine.ffmpeg import ffmpeg_path, media_info, run
+from app.engine.edl import joined_duration, target_video_size
+from app.engine.ffmpeg import media_info, run
 from app.engine.project import Clip, Project
 from app.engine.timeline import Hold, TimelinePlan
 
@@ -31,7 +31,7 @@ def _even(value: int) -> int:
     return value if value % 2 == 0 else value + 1
 
 
-def concat_clips(clips: list[Clip], dest: Path, mute: bool = True) -> Path:
+def concat_clips(clips: list[Clip], dest: Path, mute: bool = True, on_progress=None) -> Path:
     if not clips:
         raise ValueError("Add at least one video clip before exporting.")
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -78,6 +78,7 @@ def concat_clips(clips: list[Clip], dest: Path, mute: bool = True) -> Path:
             concat_a.append(f"[a{index}]")
 
     n = len(clips)
+    duration = joined_duration(clips)
     if mute:
         filters.append(f"{''.join(concat_v)}concat=n={n}:v=1:a=0[vout]")
         filter_graph = ";".join(filters)
@@ -99,7 +100,9 @@ def concat_clips(clips: list[Clip], dest: Path, mute: bool = True) -> Path:
                 "yuv420p",
                 str(dest),
                 "-y",
-            ]
+            ],
+            on_progress=on_progress,
+            duration=duration,
         )
     else:
         filters.append(f"{''.join(concat_v)}{''.join(concat_a)}concat=n={n}:v=1:a=1[vout][aout]")
@@ -127,18 +130,22 @@ def concat_clips(clips: list[Clip], dest: Path, mute: bool = True) -> Path:
                 "192k",
                 str(dest),
                 "-y",
-            ]
+            ],
+            on_progress=on_progress,
+            duration=duration,
         )
     return dest
 
 
-def apply_holds(source: Path, holds: list[Hold], dest: Path) -> Path:
+def apply_holds(source: Path, holds: list[Hold], dest: Path, on_progress=None) -> Path:
     info = media_info(source)
     duration = float(info["duration"])
     ordered = sorted((h for h in holds if h.duration > 0.02), key=lambda h: h.at_source)
     if not ordered:
         if source.resolve() != dest.resolve():
             shutil.copy2(source, dest)
+        if on_progress:
+            on_progress(1.0)
         return dest
 
     play_ranges: list[tuple[float, float, float]] = []
@@ -224,7 +231,8 @@ def apply_holds(source: Path, holds: list[Hold], dest: Path) -> Path:
             "-y",
         ]
     )
-    run(cmd)
+    out_duration = duration + sum(hold.duration for hold in ordered)
+    run(cmd, on_progress=on_progress, duration=out_duration)
     return dest
 
 
@@ -236,6 +244,7 @@ def mix_tts(
     music_path: str | None = None,
     music_volume: float = 0.2,
     voice_volume: float = 1.0,
+    on_progress=None,
 ) -> Path:
     info = media_info(video)
     duration = max(float(info["duration"]), 0.1)
@@ -309,7 +318,9 @@ def mix_tts(
             *YOUTUBE_ARGS,
             str(dest),
             "-y",
-        ]
+        ],
+        on_progress=on_progress,
+        duration=duration,
     )
     return dest
 
@@ -320,19 +331,53 @@ def export_project(
     tts_paths: list[Path],
     dest: str | Path,
     work_dir: str | Path,
+    progress=None,
+    percent_start: int = 0,
+    percent_end: int = 99,
 ) -> Path:
     dest = Path(dest)
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
+    span = max(1, int(percent_end) - int(percent_start))
+
+    def emit(message: str, percent: float) -> None:
+        if not progress:
+            return
+        value = max(0, min(100, int(round(percent))))
+        try:
+            progress(message, value)
+        except TypeError:
+            progress(message)
+
+    def hook(label: str, start: float, end: float):
+        def _inner(fraction: float) -> None:
+            frac = min(1.0, max(0.0, float(fraction)))
+            emit(f"{label}…", percent_start + span * (start + (end - start) * frac))
+
+        return _inner
+
+    emit("Joining clips…", percent_start)
     joined = work / "joined.mp4"
-    concat_clips(project.clips, joined, mute=project.mute_original)
+    concat_clips(
+        project.clips,
+        joined,
+        mute=project.mute_original,
+        on_progress=hook("Joining clips", 0.0, 0.34),
+    )
+    emit("Inserting freeze frames…", percent_start + span * 0.34)
     held = work / "held.mp4"
-    apply_holds(joined, plan.holds, held)
+    apply_holds(
+        joined,
+        plan.holds,
+        held,
+        on_progress=hook("Inserting freeze frames", 0.34, 0.58),
+    )
     items = [
         (cue.output_time, path)
         for cue, path in zip(plan.cues, tts_paths)
         if path and Path(path).is_file()
     ]
+    emit("Encoding final MP4…", percent_start + span * 0.58)
     mix_tts(
         held,
         items,
@@ -341,5 +386,6 @@ def export_project(
         music_path=project.music_path,
         music_volume=project.music_volume,
         voice_volume=getattr(project, "voice_volume", 1.0),
+        on_progress=hook("Encoding final MP4", 0.58, 1.0),
     )
     return dest

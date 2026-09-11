@@ -123,7 +123,13 @@ def ripple_cues(cues: list[Cue], start: float, end: float) -> list[Cue]:
     result: list[Cue] = []
     for cue in cues:
         if cue.video_time >= hi - 0.001:
-            result.append(Cue(video_time=max(0.0, cue.video_time - gap), text=cue.text))
+            result.append(
+                Cue(
+                    video_time=max(0.0, cue.video_time - gap),
+                    text=cue.text,
+                    should_video_stop=cue.should_video_stop,
+                )
+            )
         elif cue.video_time < lo + 0.001:
             result.append(cue)
     return result

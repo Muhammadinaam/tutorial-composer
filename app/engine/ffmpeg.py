@@ -6,6 +6,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 
@@ -83,26 +85,115 @@ def ffmpeg_available() -> tuple[bool, str]:
     return False, "FFmpeg is missing. Install it or pip install imageio-ffmpeg."
 
 
-def run(args: list[str], *, tool: str = "ffmpeg") -> str:
+def _progress_seconds(line: str) -> float | None:
+    text = line.strip()
+    if text.startswith("out_time_us="):
+        raw = text.split("=", 1)[1]
+        if raw.isdigit():
+            return int(raw) / 1_000_000.0
+        return None
+    if text.startswith("out_time_ms="):
+        raw = text.split("=", 1)[1]
+        if raw.isdigit():
+            return int(raw) / 1000.0
+        return None
+    if text.startswith("out_time="):
+        raw = text.split("=", 1)[1].strip()
+        if not raw or raw == "N/A":
+            return None
+        parts = raw.split(":")
+        if len(parts) != 3:
+            return None
+        try:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        except ValueError:
+            return None
+    return None
+
+
+def run(
+    args: list[str],
+    *,
+    tool: str = "ffmpeg",
+    on_progress: Callable[[float], None] | None = None,
+    duration: float | None = None,
+) -> str:
     if tool == "ffprobe":
         binary = ffprobe_path()
         if not binary:
             raise FileNotFoundError("ffprobe is not available.")
         cmd = [binary, *args]
-    else:
+        on_progress = None
+    elif on_progress is None:
         cmd = [ffmpeg_path(), "-hide_banner", "-y", *args]
-    proc = subprocess.run(
+    else:
+        cmd = [
+            ffmpeg_path(),
+            "-hide_banner",
+            "-nostats",
+            "-progress",
+            "pipe:1",
+            "-y",
+            *args,
+        ]
+
+    if on_progress is None:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_hide_window_kwargs(),
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "Unknown FFmpeg error").strip()
+            raise RuntimeError(detail[-4000:])
+        return proc.stdout or ""
+
+    process = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
+        bufsize=1,
         **_hide_window_kwargs(),
     )
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "Unknown FFmpeg error").strip()
+    stderr_chunks: list[str] = []
+
+    def _drain_stderr() -> None:
+        if process.stderr:
+            stderr_chunks.append(process.stderr.read() or "")
+
+    reader = threading.Thread(target=_drain_stderr, daemon=True)
+    reader.start()
+    last_pct = -1
+    total = max(0.0, float(duration or 0.0))
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            seconds = _progress_seconds(line)
+            if seconds is not None and total > 0.05:
+                frac = min(1.0, max(0.0, seconds / total))
+                pct = int(frac * 100)
+                if pct != last_pct:
+                    last_pct = pct
+                    on_progress(frac)
+            elif line.strip() == "progress=end" and total > 0.05:
+                on_progress(1.0)
+    finally:
+        if process.stdout:
+            process.stdout.close()
+        process.wait()
+        reader.join(timeout=8)
+    if process.returncode != 0:
+        detail = "".join(stderr_chunks).strip() or "Unknown FFmpeg error"
         raise RuntimeError(detail[-4000:])
-    return proc.stdout
+    if last_pct < 100:
+        on_progress(1.0)
+    return ""
 
 
 def _parse_ffmpeg_info(path: str | Path) -> dict:

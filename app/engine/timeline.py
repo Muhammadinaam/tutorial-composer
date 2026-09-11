@@ -13,6 +13,7 @@ class PlannedCue:
     gap: float
     hold: float
     output_time: float
+    should_video_stop: bool = False
 
 
 @dataclass
@@ -51,7 +52,13 @@ def build_timeline(
         )
         gap = max(0.0, next_time - cue.video_time)
         speech = max(0.0, float(durations[index]))
-        hold = max(0.0, speech - gap)
+        stop = bool(getattr(cue, "should_video_stop", False))
+        if stop:
+            hold = speech
+            hold_at = cue.video_time
+        else:
+            hold = max(0.0, speech - gap)
+            hold_at = min(max(cue.video_time, next_time), source_duration)
         output_time = cue.video_time + extra
         planned.append(
             PlannedCue(
@@ -61,11 +68,16 @@ def build_timeline(
                 gap=gap,
                 hold=hold,
                 output_time=output_time,
+                should_video_stop=stop,
             )
         )
         if hold > 0.001:
-            hold_at = min(max(cue.video_time, next_time), source_duration)
-            holds.append(Hold(at_source=hold_at, duration=hold))
+            holds.append(
+                Hold(
+                    at_source=min(max(0.0, hold_at), source_duration),
+                    duration=hold,
+                )
+            )
             extra += hold
 
     last_speech_end = 0.0
