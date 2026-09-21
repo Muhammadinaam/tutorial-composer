@@ -111,6 +111,49 @@ def _progress_seconds(line: str) -> float | None:
     return None
 
 
+def start_process(args: list[str]) -> subprocess.Popen:
+    cmd = [ffmpeg_path(), "-hide_banner", "-y", *args]
+    kwargs = _hide_window_kwargs()
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    return subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        **kwargs,
+    )
+
+
+def stop_process(process: subprocess.Popen, timeout: float = 12.0) -> str:
+    if process.poll() is None:
+        try:
+            if process.stdin:
+                process.stdin.write(b"q")
+                process.stdin.flush()
+        except Exception:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+        try:
+            _stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            _stdout, stderr = process.communicate(timeout=3)
+        detail = stderr or b""
+        if isinstance(detail, bytes):
+            return detail.decode("utf-8", errors="replace")
+        return str(detail)
+    try:
+        _stdout, stderr = process.communicate(timeout=1)
+    except Exception:
+        stderr = b""
+    if isinstance(stderr, bytes):
+        return stderr.decode("utf-8", errors="replace")
+    return str(stderr or "")
+
+
 def run(
     args: list[str],
     *,

@@ -13,6 +13,21 @@ DEFAULTS = {
     "elevenlabs_api_key": "",
     "voice": "en-US-JennyNeural",
     "lang": "en",
+    "record_monitor": 0,
+    "record_camera_enabled": True,
+    "record_camera_name": "",
+    "record_camera_shape": "circle",
+    "record_camera_size": 240,
+    "record_camera_x": -1,
+    "record_camera_y": -1,
+    "record_mic_enabled": True,
+    "record_mic_name": "",
+    "record_system_audio_enabled": False,
+    "record_system_audio_name": "",
+    "record_region_x": -1,
+    "record_region_y": -1,
+    "record_region_w": -1,
+    "record_region_h": -1,
 }
 
 
@@ -31,6 +46,12 @@ def settings_path() -> Path:
 
 def cache_dir() -> Path:
     path = settings_dir() / "cache"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def recordings_dir() -> Path:
+    path = cache_dir() / "recordings"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

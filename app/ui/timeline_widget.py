@@ -20,7 +20,7 @@ class TimelineCanvas(QWidget):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.clips: list[Clip] = []
-        self.cue_spans: list[tuple[float, float, str]] = []
+        self.cue_spans: list[tuple] = []
         self.selected = -1
         self.music_selected = False
         self.playhead = 0.0
@@ -41,7 +41,7 @@ class TimelineCanvas(QWidget):
         clips: list[Clip],
         selected: int,
         playhead: float,
-        cue_spans: list[tuple[float, float, str]] | None = None,
+        cue_spans: list[tuple] | None = None,
         music_name: str = "",
         music_duration: float = 0.0,
         music_selected: bool = False,
@@ -73,7 +73,7 @@ class TimelineCanvas(QWidget):
 
     def total_time(self) -> float:
         last_cue = 0.0
-        for start, length, _text in self.cue_spans:
+        for start, length, *_rest in self.cue_spans:
             last_cue = max(last_cue, start + length)
         return max(joined_duration(self.clips), last_cue, self.extra_end, 4.0)
 
@@ -153,9 +153,17 @@ class TimelineCanvas(QWidget):
             painter.setPen(QColor("#6b7078"))
             painter.setFont(QFont("Segoe UI", 8))
             painter.drawText(vo.adjusted(10, 0, 0, 0), Qt.AlignmentFlag.AlignVCenter, "Narration cues appear here")
-        for start, length, text in self.cue_spans:
+        for span in self.cue_spans:
+            start, length, text, *rest = span
+            ready = rest[0] if rest else True
             rect = QRect(self._time_to_x(start), vo.y(), max(10, int(length * self.pps)), vo.height())
-            self._draw_block(painter, rect, QColor("#2e7d5b"), False, text, format_timestamp(length))
+            if ready:
+                fill = QColor("#2e7d5b")
+                subtitle = format_timestamp(length)
+            else:
+                fill = QColor("#8a6a2d")
+                subtitle = "No voice — Generate"
+            self._draw_block(painter, rect, fill, not ready, text, subtitle)
 
         music = self._track_rect(2)
         if self.music_name:

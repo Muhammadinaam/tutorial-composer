@@ -234,6 +234,13 @@ QProgressBar {
     min-width: 160px;
 }
 
+QProgressBar#playBusy {
+    min-width: 72px;
+    max-width: 72px;
+    min-height: 16px;
+    max-height: 16px;
+}
+
 QProgressBar::chunk {
     background-color: #3d8fd1;
     border-radius: 3px;
@@ -293,4 +300,20 @@ QGroupBox::title {
     subcontrol-origin: margin;
     left: 10px;
     padding: 0 4px;
+}
+
+QWidget#recordingBar {
+    background-color: #25262a;
+    border: 1px solid #3d8fd1;
+    border-radius: 6px;
+}
+
+QLabel#recordTimeLabel {
+    color: #e07070;
+    font-weight: 700;
+}
+
+QWidget#cameraWindow {
+    background-color: #111;
+    border: 2px solid #f2f2f2;
 }

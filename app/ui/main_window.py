@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from time import monotonic
 
-from PySide6.QtCore import QUrl, Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QKeyEvent, QPixmap
+from PySide6.QtCore import QRect, QUrl, Qt, QTimer
+from PySide6.QtGui import QAction, QCloseEvent, QKeyEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -26,10 +26,12 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabBar,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from app.engine.capture import CaptureRegion, CaptureRequest, ScreenRecorder, even, new_recording_path
 from app.engine.edl import (
     clip_joined_start,
     delete_joined_range,
@@ -58,8 +60,13 @@ from app.engine.voices import (
     list_voices,
     matching_voice,
 )
+from app.ui.camera_window import CameraWindow
+from app.ui.record_page import RecordPage
+from app.ui.region_frame import RecordingBar, RecordingOutline, RegionFrame, screen_at_index
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.timeline_widget import TimelineWidget
+from app.ui.voice_cue import VoiceCuePlayer
+from app.ui.win_hotkey import WinStopHotkey
 from app.ui.workers import TaskWorker
 
 
@@ -90,6 +97,7 @@ class MainWindow(QMainWindow):
         self._audio_hold = False
         self._hold_at = 0.0
         self._hold_started = 0.0
+        self._waiting_for_voice = False
         self._video_frozen = False
         self._freeze_index = -1
         self._freeze_clock = 0.0
@@ -99,16 +107,34 @@ class MainWindow(QMainWindow):
         self.tts_store: dict[str, tuple] = {}
         self._loading_table = False
         self._switching_lang = False
+        self._recorder = ScreenRecorder()
+        self._region_frame: RegionFrame | None = None
+        self._record_bar: RecordingBar | None = None
+        self._record_outline: RecordingOutline | None = None
+        self._warming = False
+        self._warmup_finishing = False
+        self._sfx_play_when_ready = False
+        self._sfx_stopping = False
+        self._defer_video = False
+        self._camera_window: CameraWindow | None = None
+        self._stop_hotkey: WinStopHotkey | None = None
+        self._region_full = True
+        self._camera_closed = False
+        self._stopping_record = False
+        self._starting_record = False
+        self._record_watch = QTimer(self)
+        self._record_watch.setInterval(500)
+        self._record_watch.timeout.connect(self._watch_recorder)
 
         self._preview_player = QMediaPlayer(self)
         self._preview_audio = QAudioOutput(self)
         self._preview_player.setAudioOutput(self._preview_audio)
 
-        self.narration_player = QMediaPlayer(self)
-        self.narration_audio = QAudioOutput(self)
-        self.narration_audio.setVolume(1.0)
-        self.narration_player.setAudioOutput(self.narration_audio)
+        self.voice_sfx = VoiceCuePlayer(self)
         self._preview_audio.setVolume(1.0)
+        self._warmup_timer = QTimer(self)
+        self._warmup_timer.setSingleShot(True)
+        self._warmup_timer.timeout.connect(self._warmup_timeout)
 
         self.music_player = QMediaPlayer(self)
         self.music_audio = QAudioOutput(self)
@@ -190,8 +216,15 @@ class MainWindow(QMainWindow):
         header.addWidget(settings_btn)
         outer.addLayout(header)
 
+        self.mode_tabs = QTabWidget()
+        self.record_page = RecordPage()
+        compose = QWidget()
+        compose_box = QVBoxLayout(compose)
+        compose_box.setContentsMargins(0, 0, 0, 0)
+        compose_box.setSpacing(6)
+
         vertical = QSplitter(Qt.Orientation.Vertical)
-        outer.addWidget(vertical, 1)
+        compose_box.addWidget(vertical, 1)
 
         top = QSplitter(Qt.Orientation.Horizontal)
         preview = self._panel()
@@ -214,15 +247,33 @@ class MainWindow(QMainWindow):
 
         controls = QHBoxLayout()
         self.play_btn = QPushButton("Play")
+        self.play_busy = QProgressBar()
+        self.play_busy.setObjectName("playBusy")
+        self.play_busy.setRange(0, 0)
+        self.play_busy.setTextVisible(False)
+        self.play_busy.setFixedWidth(72)
+        self.play_busy.setFixedHeight(16)
+        self.play_busy.setVisible(False)
+        self.play_btn.setToolTip(
+            "Preview the timeline. The picture waits at each line until voice starts. "
+            "A short pause is normal here; Export is timed correctly."
+        )
         self.time_label = QLabel("0:00 / 0:00")
         self.mute_box = QCheckBox("Mute original audio")
         self.mute_box.setChecked(True)
         self.mute_box.setToolTip("Silence the recording's own sound while you preview.")
         controls.addWidget(self.play_btn)
+        controls.addWidget(self.play_busy)
         controls.addWidget(self.time_label)
         controls.addStretch()
         controls.addWidget(self.mute_box)
         preview_box.addLayout(controls)
+        self.preview_hint = QLabel(
+            "During Play, the picture waits until voice starts — a short delay is expected. Export keeps picture and voice in sync."
+        )
+        self.preview_hint.setObjectName("hintLabel")
+        self.preview_hint.setWordWrap(True)
+        preview_box.addWidget(self.preview_hint)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 0)
@@ -399,7 +450,11 @@ class MainWindow(QMainWindow):
         bottom.addWidget(self.export_btn)
         bottom.addWidget(self.export_progress)
         bottom.addWidget(self.status_label, 1)
-        outer.addLayout(bottom)
+        compose_box.addLayout(bottom)
+        self.mode_tabs.addTab(self.record_page, "Record")
+        self.mode_tabs.addTab(compose, "Compose")
+        self.mode_tabs.setCurrentIndex(1)
+        outer.addWidget(self.mode_tabs, 1)
         self.statusBar().showMessage("Ready")
 
     def _bind(self) -> None:
@@ -411,9 +466,9 @@ class MainWindow(QMainWindow):
         self.slider.sliderReleased.connect(self._seek_from_slider)
         self.slider.sliderMoved.connect(self._slider_scrub)
         self.slider.valueChanged.connect(self._slider_value)
-        self.narration_player.mediaStatusChanged.connect(self._narration_status)
-        self.narration_player.playbackStateChanged.connect(self._narration_play_state)
-        self.narration_player.errorOccurred.connect(self._narration_error)
+        self.voice_sfx.ready.connect(self._sfx_loaded)
+        self.voice_sfx.failed.connect(self._sfx_failed)
+        self.voice_sfx.playingChanged.connect(self._sfx_playing_changed)
         self.add_video_btn.clicked.connect(self.add_videos)
         self.add_image_btn.clicked.connect(self.add_images)
         self.add_music_btn.clicked.connect(self.add_music)
@@ -450,6 +505,14 @@ class MainWindow(QMainWindow):
         self._warn_timer.setSingleShot(True)
         self._warn_timer.setInterval(400)
         self._warn_timer.timeout.connect(self.refresh_warnings)
+        self.record_page.startRequested.connect(self.start_recording)
+        self.record_page.selectAreaRequested.connect(self._select_record_area)
+        self.record_page.fullScreenRequested.connect(self._use_full_screen_region)
+        self.record_page.monitorChanged.connect(self._record_monitor_changed)
+        self._stop_shortcut = QShortcut(QKeySequence("F10"), self)
+        self._stop_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._stop_shortcut.activated.connect(self._hotkey_stop)
+        self._restore_record_region_label()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if self.cue_table.hasFocus() or self.voice_combo.hasFocus() or self.lang_combo.hasFocus():
@@ -639,14 +702,24 @@ class MainWindow(QMainWindow):
     def _spoken_cues(self) -> list[Cue]:
         return [c for c in self.project.current().cues if c.text.strip()]
 
-    def _cue_spans(self) -> list[tuple[float, float, str]]:
+    def _has_generated_voices(self) -> bool:
+        cues = self._spoken_cues()
+        return bool(
+            cues
+            and self.plan
+            and len(self.tts_paths) == len(cues)
+            and all(Path(path).is_file() for path in self.tts_paths)
+        )
+
+    def _cue_spans(self) -> list[tuple[float, float, str, bool]]:
+        ready = self._has_generated_voices()
         if self.plan and self.plan.cues:
             spans = []
             for cue in self.plan.cues:
                 label = cue.text[:42] or "Cue"
                 if cue.should_video_stop:
                     label = f"Freeze · {label}"
-                spans.append((cue.video_time, max(0.4, cue.tts_duration), label))
+                spans.append((cue.video_time, max(0.4, cue.tts_duration), label, ready))
             return spans
         cues = self._spoken_cues()
         spans = []
@@ -659,7 +732,7 @@ class MainWindow(QMainWindow):
             label = cue.text[:42] or "Cue"
             if cue.should_video_stop:
                 label = f"Freeze · {label}"
-            spans.append((cue.video_time, max(0.4, duration), label))
+            spans.append((cue.video_time, max(0.4, duration), label, False))
         return spans
 
     def _restore_tts(self) -> None:
@@ -683,12 +756,13 @@ class MainWindow(QMainWindow):
             self.tts_paths = []
             self.tts_durations = []
             self.plan = None
-            self.narration_player.stop()
+            self.voice_sfx.stop()
             self._narration_index = -1
             self._narration_finished = -1
             self._narration_pending = None
             self._narration_gen += 1
             self._audio_hold = False
+            self._waiting_for_voice = False
             self._discard_video_freeze()
 
     def _follow_changed(self, checked: bool) -> None:
@@ -699,8 +773,7 @@ class MainWindow(QMainWindow):
 
     def _apply_voice_volume(self) -> None:
         gain = self._voice_gain()
-        self.narration_audio.setMuted(False)
-        self.narration_audio.setVolume(gain)
+        self.voice_sfx.setVolume(gain)
         self._preview_audio.setMuted(False)
         self._preview_audio.setVolume(gain)
 
@@ -783,11 +856,15 @@ class MainWindow(QMainWindow):
 
     def _cue_end(self) -> float:
         end = 0.0
-        for start, length, _text in self._cue_spans():
+        for start, length, *_rest in self._cue_spans():
             end = max(end, start + length)
         return end
 
     def _refresh_transport(self) -> None:
+        if self._audio_hold:
+            self.playhead = self._hold_at
+            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.player.pause()
         total = max(joined_duration(self.project.clips), 0.0)
         self.slider.blockSignals(True)
         self.slider.setRange(0, max(0, int(total * 1000)))
@@ -800,6 +877,12 @@ class MainWindow(QMainWindow):
         muted = bool(self.project.mute_original)
         self.audio_out.setMuted(muted)
         self.audio_out.setVolume(0.0 if muted else 1.0)
+        # Detach the video player's audio device while muted so voice preview
+        # can start without sharing WASAPI with the original soundtrack.
+        if muted:
+            self.player.setAudioOutput(None)
+        elif self.player.audioOutput() is not self.audio_out:
+            self.player.setAudioOutput(self.audio_out)
 
     def _mute_changed(self, checked: bool) -> None:
         self.project.mute_original = checked
@@ -822,10 +905,13 @@ class MainWindow(QMainWindow):
         self.refresh_timeline()
 
     def _timeline_seek(self, seconds: float) -> None:
+        self.player.pause()
+        self._image_clock.stop()
         if not self._scrubbing:
             self._reset_narration_player()
             self.music_player.pause()
         self._audio_hold = False
+        self._waiting_for_voice = False
         self._discard_video_freeze()
         self._music_lead = 0.0
         self._scrubbing = True
@@ -873,7 +959,7 @@ class MainWindow(QMainWindow):
                     self.player.play()
         elif not live and not self._playing:
             self.player.pause()
-            self.narration_player.pause()
+            self._stop_sfx()
             self.music_player.pause()
             self._image_clock.stop()
 
@@ -932,7 +1018,7 @@ class MainWindow(QMainWindow):
                 self._begin_seek(target_ms)
             self.player.setPosition(target_ms)
         self._apply_mute()
-        if self._video_should_run():
+        if self._video_should_run() and not getattr(self, "_defer_video", False):
             self.player.play()
 
     def add_videos(self) -> None:
@@ -1041,6 +1127,9 @@ class MainWindow(QMainWindow):
     def toggle_play(self) -> None:
         if not self.project.clips:
             return
+        if self._warming:
+            self._cancel_warmup()
+            return
         if self._playing:
             self._pause_all()
             return
@@ -1049,27 +1138,109 @@ class MainWindow(QMainWindow):
         mapped = map_joined_to_clip(self.project.clips, self.playhead)
         if mapped:
             self.selected_index = mapped[2]
-        self._playing = True
-        self.play_btn.setText("Pause")
+        url = self._warmup_url()
+        if url is not None:
+            self._start_warmup(url)
+            return
+        self._launch_playback()
+
+    def _due_cue_index(self) -> int | None:
+        if not self.plan or len(self.tts_paths) != len(self.plan.cues):
+            return None
+        due = self._cue_index_at(self.playhead, lead=self.NARRATION_DUE_SLACK)
+        if due is None:
+            due = self._cue_index_at(self.playhead, lead=self.NARRATION_PRELOAD)
+        if due is None and self.plan.cues:
+            due = 0
+        return due
+
+    def _warmup_url(self) -> QUrl | None:
+        due = self._due_cue_index()
+        return self._narration_url(due) if due is not None else None
+
+    def _set_play_busy(self, busy: bool, text: str | None = None) -> None:
+        self.play_busy.setVisible(busy)
+        if text is not None:
+            self.play_btn.setText(text)
+        elif busy:
+            self.play_btn.setText("Loading…")
+        elif self._playing:
+            self.play_btn.setText("Pause")
+        else:
+            self.play_btn.setText("Play")
+
+    def _sfx_ready(self) -> bool:
+        return self.voice_sfx.isReady()
+
+    def _start_warmup(self, url: QUrl) -> None:
+        self._warming = True
+        self._warmup_finishing = False
+        self._narration_gen += 1
+        self._narration_token = self._narration_gen
+        self._narration_finished = -1
+        self._narration_pending = None
+        self._set_play_busy(True)
+        self._narration_retry.stop()
         self._apply_mute()
-        due = self._cue_index_at(self.playhead, lead=self.NARRATION_LEAD)
+        self.player.pause()
+        if self.voice_sfx.source() != url or not self._sfx_ready():
+            self.voice_sfx.setSource(url)
+            self._warmup_timer.start(2500)
+        else:
+            QTimer.singleShot(0, self._finish_warmup)
+
+    def _queue_finish_warmup(self) -> None:
+        if not self._warming or self._warmup_finishing:
+            return
+        self._warmup_finishing = True
+        QTimer.singleShot(0, self._finish_warmup)
+
+    def _warmup_timeout(self) -> None:
+        self._queue_finish_warmup()
+
+    def _cancel_warmup(self) -> None:
+        self._warmup_timer.stop()
+        self._warming = False
+        self._warmup_finishing = False
+        self._sfx_play_when_ready = False
+        self._stop_sfx()
+        self._set_play_busy(False, "Play")
+
+    def _finish_warmup(self) -> None:
+        self._warmup_finishing = False
+        if not self._warming:
+            return
+        self._warmup_timer.stop()
+        self._warming = False
+        self._launch_playback()
+
+    def _launch_playback(self) -> None:
+        self._playing = True
+        self._set_play_busy(False, "Pause")
+        self._apply_mute()
+        due = self._cue_index_at(self.playhead, lead=self.NARRATION_DUE_SLACK)
         if due is not None and self._cue_wants_stop(due):
             self._begin_video_freeze(due)
-        self._show_current_media(force=False)
         self._sync_narration(force=True)
+        self._show_current_media(force=False)
         self._sync_music(force=True)
         if self._video_should_run():
             self._resume_transport()
 
     def _pause_all(self) -> None:
+        self._warmup_timer.stop()
         self._playing = False
         self._audio_hold = False
+        self._waiting_for_voice = False
+        self._warming = False
+        self._warmup_finishing = False
+        self._sfx_play_when_ready = False
         self._joining = False
         self._discard_video_freeze()
         self._music_lead = 0.0
-        self.play_btn.setText("Play")
+        self._set_play_busy(False, "Play")
         self.player.pause()
-        self.narration_player.pause()
+        self._stop_sfx()
         self.music_player.pause()
         self._image_clock.stop()
         self._narration_retry.stop()
@@ -1082,7 +1253,7 @@ class MainWindow(QMainWindow):
             self._image_clock.stop()
 
     def _tick_image(self) -> None:
-        if not self._playing or self._audio_hold or self._video_frozen:
+        if not self._playing or self._audio_hold or self._waiting_for_voice or self._video_frozen:
             return
         self.playhead += 0.033
         total = joined_duration(self.project.clips)
@@ -1102,12 +1273,15 @@ class MainWindow(QMainWindow):
 
     def _on_play_state(self, state) -> None:
         if not self._playing:
-            self.play_btn.setText("Play")
+            if not self._warming:
+                self.play_btn.setText("Play")
             return
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self._joining = False
+            if self._audio_hold or self._waiting_for_voice:
+                self.player.pause()
             return
-        if self._audio_hold or self._video_frozen or self._scrubbing or self._joining or self._seeking:
+        if self._audio_hold or self._waiting_for_voice or self._video_frozen or self._scrubbing or self._joining or self._seeking:
             return
         QTimer.singleShot(0, self._continue_playback)
 
@@ -1153,7 +1327,7 @@ class MainWindow(QMainWindow):
                     self.player.play()
 
     def _continue_playback(self) -> None:
-        if not self._playing or self._audio_hold or self._video_frozen or self._scrubbing or self._joining:
+        if not self._playing or self._audio_hold or self._waiting_for_voice or self._video_frozen or self._scrubbing or self._joining:
             return
         clip = self.current_clip()
         if not clip:
@@ -1169,7 +1343,7 @@ class MainWindow(QMainWindow):
         self.player.play()
 
     def _on_position(self, position: int) -> None:
-        if self._slider_dragging or self._scrubbing or self._audio_hold or self._video_frozen or self._joining:
+        if self._slider_dragging or self._scrubbing or self._audio_hold or self._waiting_for_voice or self._video_frozen or self._joining:
             return
         if self._seeking:
             target = self._seek_target_ms
@@ -1198,9 +1372,12 @@ class MainWindow(QMainWindow):
     def _slider_pressed(self) -> None:
         self._slider_dragging = True
         self._scrubbing = True
+        self.player.pause()
+        self._image_clock.stop()
         self._reset_narration_player()
         self.music_player.pause()
         self._audio_hold = False
+        self._waiting_for_voice = False
         self._discard_video_freeze()
         self._music_lead = 0.0
 
@@ -1218,12 +1395,8 @@ class MainWindow(QMainWindow):
     def _seek_from_slider(self) -> None:
         self._finish_user_seek(self.slider.value() / 1000.0)
 
-    NARRATION_LEAD = 0.08
-    _LOADED = {
-        QMediaPlayer.MediaStatus.LoadedMedia,
-        QMediaPlayer.MediaStatus.BufferedMedia,
-        QMediaPlayer.MediaStatus.BufferingMedia,
-    }
+    NARRATION_PRELOAD = 3.0
+    NARRATION_DUE_SLACK = 0.02
 
     def _cue_index_at(self, moment: float, lead: float = 0.0) -> int | None:
         if not self.plan or len(self.tts_paths) != len(self.plan.cues):
@@ -1257,13 +1430,14 @@ class MainWindow(QMainWindow):
         self._narration_pending = None
         self._narration_index = -1
         self._narration_finished = -1
-        self.narration_player.stop()
-        self.narration_player.setSource(QUrl())
+        self._sfx_play_when_ready = False
+        self._stop_sfx()
 
     def _finish_user_seek(self, seconds: float) -> None:
         self._slider_dragging = False
         self._scrubbing = False
         self._audio_hold = False
+        self._waiting_for_voice = False
         self._discard_video_freeze()
         self._music_lead = 0.0
         self._reset_narration_player()
@@ -1272,24 +1446,24 @@ class MainWindow(QMainWindow):
         mapped = map_joined_to_clip(self.project.clips, self.playhead)
         if mapped:
             self.selected_index = mapped[2]
+        self.player.pause()
+        self.music_player.pause()
+        self._image_clock.stop()
+        self._sync_narration(force=True)
         self._refresh_transport()
         self.refresh_timeline()
         self._show_current_media(force=True)
-        if self._playing:
+        if self._playing and self._video_should_run():
+            self._resume_transport()
+        elif not self._playing:
             self.player.pause()
-            self.music_player.pause()
-            self._sync_narration(force=True)
-            if self._video_should_run():
-                self._resume_transport()
-        else:
-            self.player.pause()
-            self._sync_narration(force=True)
 
     def _video_should_run(self) -> bool:
         return (
             self._playing
             and not self._scrubbing
             and not self._audio_hold
+            and not self._waiting_for_voice
             and not self._video_frozen
         )
 
@@ -1335,7 +1509,7 @@ class MainWindow(QMainWindow):
     def _freeze_timeout(self) -> None:
         if not self._video_frozen:
             return
-        if self.narration_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+        if self.voice_sfx.isPlaying():
             self._freeze_timer.start(400)
             return
         if self._narration_index >= 0:
@@ -1345,18 +1519,33 @@ class MainWindow(QMainWindow):
 
     def _hold_transport(self, at: float) -> None:
         self._audio_hold = True
+        self._waiting_for_voice = True
         self._hold_at = max(0.0, at)
         self._hold_started = monotonic()
         self.playhead = self._hold_at
+        mapped = map_joined_to_clip(self.project.clips, self.playhead)
+        if mapped:
+            self.selected_index = mapped[2]
         self.player.pause()
         self.music_player.pause()
         self._image_clock.stop()
+        self._defer_video = True
+        try:
+            self._show_current_media(force=True)
+        finally:
+            self._defer_video = False
+        self.player.pause()
         self._refresh_transport()
 
     def _resume_transport(self) -> None:
         if self._scrubbing:
             return
+        if self._waiting_for_voice and not self._voice_is_audible():
+            self.player.pause()
+            self._image_clock.stop()
+            return
         self._audio_hold = False
+        self._waiting_for_voice = False
         if not self._playing:
             return
         if self._video_frozen:
@@ -1371,160 +1560,144 @@ class MainWindow(QMainWindow):
             self.player.play()
         self._sync_music(force=True)
 
-    def _stop_narration(self) -> None:
-        self._narration_retry.stop()
-        if self.narration_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.narration_player.pause()
-        self._narration_index = -1
-        self._narration_pending = None
-        if self._audio_hold and not self._scrubbing:
+    def _voice_is_audible(self) -> bool:
+        return self.voice_sfx.isPlaying()
+
+    def _stop_sfx(self) -> None:
+        self._sfx_stopping = True
+        self._sfx_play_when_ready = False
+        self.voice_sfx.stop()
+        self._sfx_stopping = False
+
+    def _play_sfx(self) -> None:
+        self._sfx_play_when_ready = False
+        self._apply_voice_volume()
+        try:
+            self.voice_sfx.play()
+        except Exception:
+            self._fail_voice("Voice could not play. Generate voices, then Play again.")
+            return
+        if self._voice_is_audible() and self._playing and not self._scrubbing:
             self._resume_transport()
-        elif self._video_frozen:
+
+    def _sfx_loaded(self) -> None:
+        if self._warming:
+            self._queue_finish_warmup()
+            return
+        if self._sfx_play_when_ready:
+            self._sfx_play_when_ready = False
+            if self._playing and not self._scrubbing:
+                self._play_sfx()
+
+    def _sfx_failed(self) -> None:
+        if self._warming:
+            self._queue_finish_warmup()
+            return
+        self._fail_voice("Voice could not play. Generate voices, then Play again.")
+
+    def _sfx_playing_changed(self) -> None:
+        if self._sfx_stopping or self._warming:
+            return
+        if self.voice_sfx.isPlaying():
+            self._waiting_for_voice = False
+            self._audio_hold = False
+            if self._playing and not self._scrubbing:
+                self._resume_transport()
+            return
+        if not self._playing or self._scrubbing or self._sfx_play_when_ready:
+            return
+        if self._narration_index < 0:
+            return
+        self._narration_finished = self._narration_index
+        finished = self._narration_index
+        self._narration_index = -1
+        if self._video_frozen and (self._freeze_index == finished or finished < 0):
             self._end_video_freeze(resume=True)
 
-    def _needs_reload(self, url: QUrl) -> bool:
-        status = self.narration_player.mediaStatus()
-        return (
-            self.narration_player.source() != url
-            or status == QMediaPlayer.MediaStatus.EndOfMedia
-            or status == QMediaPlayer.MediaStatus.NoMedia
-            or status == QMediaPlayer.MediaStatus.InvalidMedia
-        )
+    def _fail_voice(self, message: str) -> None:
+        self._waiting_for_voice = False
+        self._audio_hold = False
+        self._pause_all()
+        self._set_status(message)
 
-    def _load_narration(self, url: QUrl) -> None:
-        self.narration_player.stop()
-        self.narration_player.setSource(QUrl())
-        self.narration_player.setSource(url)
+    def _stop_narration(self) -> None:
+        self._narration_retry.stop()
+        self._stop_sfx()
+        self._narration_index = -1
+        self._narration_pending = None
+        self._waiting_for_voice = False
+        self._audio_hold = False
+        if self._video_frozen:
+            self._end_video_freeze(resume=True)
 
-    def _start_narration(self, index: int, offset: float, play: bool) -> None:
+    def _start_narration(self, index: int, play: bool) -> None:
         url = self._narration_url(index)
         if url is None:
             return
         self._narration_index = index
         self._narration_token = self._narration_gen
-        self._narration_pending = (offset, play)
-        if self._needs_reload(url):
-            self._load_narration(url)
+        if self.voice_sfx.source() != url:
+            self._stop_sfx()
+            self.voice_sfx.setSource(url)
+        if not play:
             return
-        self._apply_narration_pending()
+        if self._sfx_ready():
+            self._play_sfx()
+        else:
+            self._sfx_play_when_ready = True
 
     def _sync_narration(self, force: bool = False) -> None:
-        self.narration_audio.setMuted(False)
+        if self._warming:
+            return
         self._apply_voice_volume()
         if not self.plan or len(self.tts_paths) != len(self.plan.cues):
             self._stop_narration()
             return
         if force:
             self._narration_finished = -1
-        due = self._cue_index_at(self.playhead, lead=self.NARRATION_LEAD)
+        due = self._cue_index_at(self.playhead, lead=self.NARRATION_DUE_SLACK)
+        upcoming = self._cue_index_at(self.playhead, lead=self.NARRATION_PRELOAD)
         if due == self._narration_finished:
             due = None
-        playing = self.narration_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-        if not force and self._playing and self._narration_index >= 0 and playing:
-            if due is None or due == self._narration_index:
-                return
+        if upcoming == self._narration_finished:
+            upcoming = None
+        audible = self._voice_is_audible()
+        if not force and self._playing and due is not None and due == self._narration_index and audible:
+            return
         if due is None:
-            if playing and not force and self._playing:
+            if audible and not force and self._playing:
+                return
+            if upcoming is not None:
+                if self._narration_index != upcoming:
+                    self._start_narration(upcoming, False)
                 return
             self._stop_narration()
             return
-        if not force and due == self._narration_index:
-            if playing or self._narration_pending:
-                return
-            self._retry_narration()
-            return
         if not self._playing:
-            if force:
-                self._start_narration(
-                    due, max(0.0, self.playhead - self.plan.cues[due].video_time), False
-                )
+            self._start_narration(due, False)
             return
-        offset = max(0.0, self.playhead - self.plan.cues[due].video_time)
-        start_at = offset if force and offset > 0.05 else 0.0
+        cue_time = self.plan.cues[due].video_time
         if self._cue_wants_stop(due):
             self._begin_video_freeze(due)
         elif self._video_frozen:
             self._end_video_freeze(resume=False)
-        if self.narration_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-            self._hold_transport(self.playhead)
-        self._start_narration(due, start_at, True)
-        self._narration_retry.start(120)
+        if not force and due == self._narration_index and (audible or self._waiting_for_voice):
+            return
+        self.playhead = cue_time
+        self._hold_transport(cue_time)
+        self._start_narration(due, True)
 
     def _retry_narration(self) -> None:
-        if self._scrubbing or getattr(self, "_narration_token", -1) != self._narration_gen:
+        if self._warming or self._scrubbing:
             return
         if not self._playing or self._narration_index < 0:
             return
-        if self.narration_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+        if self._voice_is_audible():
             self._resume_transport()
             return
-        if self._audio_hold and monotonic() - self._hold_started > 4.0:
-            self._set_status("Voice file did not start. Check Generate voices, then Play again.")
-            self._resume_transport()
+        if self._sfx_play_when_ready:
             return
-        if self._narration_pending:
-            self._apply_narration_pending()
-            return
-        url = self._narration_url(self._narration_index)
-        if url is None:
-            return
-        if self._needs_reload(url):
-            self._narration_pending = (0.0, True)
-            self._load_narration(url)
-            return
-        self.narration_player.setPosition(0)
-        self.narration_player.play()
-
-    def _apply_narration_pending(self) -> None:
-        if not self._narration_pending:
-            return
-        if getattr(self, "_narration_token", self._narration_gen) != self._narration_gen:
-            self._narration_pending = None
-            return
-        offset, should_play = self._narration_pending
-        self._narration_pending = None
-        if self.narration_player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
-            self.narration_player.setPosition(0)
-        elif offset > 0.02:
-            self.narration_player.setPosition(int(offset * 1000))
-        if should_play and self._playing and not self._scrubbing:
-            self.narration_player.play()
-            if self.narration_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-                self._resume_transport()
-            else:
-                self._narration_retry.start(80)
-        else:
-            self.narration_player.pause()
-
-    def _narration_play_state(self, state) -> None:
-        if getattr(self, "_narration_token", -1) != self._narration_gen:
-            return
-        if state == QMediaPlayer.PlaybackState.PlayingState and not self._scrubbing:
-            self._resume_transport()
-
-    def _narration_status(self, status) -> None:
-        if getattr(self, "_narration_token", self._narration_gen) != self._narration_gen:
-            return
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            if self._narration_index >= 0:
-                self._narration_finished = self._narration_index
-            finished = self._narration_index
-            self._narration_index = -1
-            self._narration_pending = None
-            if self._audio_hold:
-                self._resume_transport()
-            elif self._video_frozen and (self._freeze_index == finished or finished < 0):
-                self._end_video_freeze(resume=True)
-            return
-        if status in self._LOADED:
-            self._apply_narration_pending()
-
-    def _narration_error(self, *_args) -> None:
-        if getattr(self, "_narration_token", -1) != self._narration_gen:
-            return
-        if self._playing and self._narration_index >= 0:
-            self._set_status("Retrying voice playback…")
-            self._narration_retry.start(150)
+        self._start_narration(self._narration_index, True)
 
     def _sync_music(self, force: bool = False) -> None:
         path = self.project.music_path
@@ -2094,13 +2267,320 @@ class MainWindow(QMainWindow):
         save_project(self.project, path)
         self._set_status("Project saved.")
 
+    def _restore_record_region_label(self) -> None:
+        data = load_settings()
+        x = int(data.get("record_region_x", -1) or -1)
+        y = int(data.get("record_region_y", -1) or -1)
+        w = int(data.get("record_region_w", -1) or -1)
+        h = int(data.get("record_region_h", -1) or -1)
+        if w > 0 and h > 0:
+            self._region_full = False
+            self.record_page.set_region_label(QRect(x, y, w, h))
+        else:
+            self._region_full = True
+            self.record_page.set_region_label(None, full=True)
+
+    def _ensure_region_frame(self) -> RegionFrame:
+        if self._region_frame is None:
+            self._region_frame = RegionFrame()
+            self._region_frame.startRequested.connect(self.start_recording)
+            self._region_frame.cancelRequested.connect(self._hide_region_frame)
+            self._region_frame.regionChanged.connect(self._region_frame_changed)
+            self._region_frame.regionCommitted.connect(self._region_frame_committed)
+        return self._region_frame
+
+    def _hide_region_frame(self) -> None:
+        if self._region_frame:
+            self._region_frame.hide()
+
+    def _saved_region_rect(self) -> QRect | None:
+        data = load_settings()
+        w = int(data.get("record_region_w", -1) or -1)
+        h = int(data.get("record_region_h", -1) or -1)
+        if w <= 0 or h <= 0:
+            return None
+        return QRect(
+            int(data.get("record_region_x", 0) or 0),
+            int(data.get("record_region_y", 0) or 0),
+            w,
+            h,
+        )
+
+    def _select_record_area(self) -> None:
+        frame = self._ensure_region_frame()
+        frame.attach_screen(self.record_page.monitor_index(), self._saved_region_rect())
+        self._region_full = False
+        self._region_frame_committed()
+
+    def _use_full_screen_region(self) -> None:
+        frame = self._ensure_region_frame()
+        frame.use_full_screen(self.record_page.monitor_index())
+        self._region_full = True
+        self.record_page.set_region_label(None, full=True)
+        self.record_page.persist(
+            {
+                "record_region_x": -1,
+                "record_region_y": -1,
+                "record_region_w": -1,
+                "record_region_h": -1,
+            }
+        )
+
+    def _record_monitor_changed(self, index: int) -> None:
+        if self._region_frame and self._region_frame.isVisible():
+            if self._region_full:
+                self._region_frame.use_full_screen(index)
+            else:
+                self._region_frame.attach_screen(index, None)
+            self.record_page.set_region_label(
+                None if self._region_full else self._region_frame.capture_rect(),
+                full=self._region_full,
+            )
+
+    def _region_frame_changed(self) -> None:
+        if not self._region_frame:
+            return
+        rect = self._region_frame.capture_rect()
+        self._region_full = False
+        self.record_page.set_region_label(rect)
+
+    def _region_frame_committed(self) -> None:
+        if not self._region_frame:
+            return
+        rect = self._region_frame.capture_rect()
+        self._region_full = False
+        self.record_page.set_region_label(rect)
+        self.record_page.persist(
+            {
+                "record_region_x": rect.x(),
+                "record_region_y": rect.y(),
+                "record_region_w": rect.width(),
+                "record_region_h": rect.height(),
+            }
+        )
+
+    def _current_capture_rect(self) -> QRect:
+        if self._region_frame and self._region_frame.isVisible():
+            return self._region_frame.capture_rect()
+        saved = self._saved_region_rect()
+        if saved is not None and not self._region_full:
+            return saved
+        screen = screen_at_index(self.record_page.monitor_index())
+        geo = screen.geometry()
+        return QRect(geo.x(), geo.y(), even(geo.width()), even(geo.height()))
+
+    def _to_capture_region(self, rect) -> CaptureRegion:
+        screen = screen_at_index(self.record_page.monitor_index())
+        dpr = float(screen.devicePixelRatio() or 1.0)
+        geo = screen.geometry()
+        return CaptureRegion(
+            x=int(round(rect.x() * dpr)),
+            y=int(round(rect.y() * dpr)),
+            width=even(int(round(rect.width() * dpr))),
+            height=even(int(round(rect.height() * dpr))),
+            screen_index=self.record_page.monitor_index(),
+            screen_x=int(round(geo.x() * dpr)),
+            screen_y=int(round(geo.y() * dpr)),
+        )
+
+    def start_recording(self) -> None:
+        if self._recorder.running or self._starting_record:
+            return
+        ok, detail = ffmpeg_available()
+        if not ok:
+            QMessageBox.warning(self, "Record", detail)
+            return
+        if self.record_page.system_audio_name() is None and self.record_page.system_on.isChecked():
+            QMessageBox.warning(
+                self,
+                "System audio",
+                "No loopback device is selected. Turn off System audio or pick Stereo Mix / a virtual cable.",
+            )
+            return
+        self.record_page.persist()
+        rect = self._current_capture_rect()
+        if self._region_frame:
+            self._region_frame.hide()
+        self._starting_record = True
+        self._pending_record_rect = rect
+        self.showMinimized()
+        self._show_record_bar(rect)
+        self._start_camera(rect)
+        if self._stop_hotkey is None:
+            self._stop_hotkey = WinStopHotkey(self)
+            self._stop_hotkey.pressed.connect(self._hotkey_stop)
+        self._stop_hotkey.register()
+        QTimer.singleShot(300, self._begin_ffmpeg_capture)
+
+    def _begin_ffmpeg_capture(self) -> None:
+        if not self._starting_record:
+            return
+        rect = getattr(self, "_pending_record_rect", self._current_capture_rect())
+        dest = new_recording_path()
+        request = CaptureRequest(
+            dest=dest,
+            region=self._to_capture_region(rect),
+            mic=self.record_page.mic_name(),
+            system_audio=self.record_page.system_audio_name(),
+        )
+        try:
+            self._recorder.start(request)
+        except Exception as exc:
+            self._starting_record = False
+            self._teardown_recording_ui()
+            QMessageBox.critical(self, "Record", str(exc))
+            return
+        self._record_watch.start()
+        self._starting_record = False
+        self._set_status("Recording… F10 stops.")
+
+    def _show_record_bar(self, rect) -> None:
+        if self._record_bar is None:
+            self._record_bar = RecordingBar()
+            self._record_bar.stopRequested.connect(self._stop_recording)
+            self._record_bar.hideCameraRequested.connect(self._hide_camera)
+            self._record_bar.showCameraRequested.connect(self._show_camera)
+            self._record_bar.closeCameraRequested.connect(self._close_camera)
+            bar_stop = QShortcut(QKeySequence("F10"), self._record_bar)
+            bar_stop.activated.connect(self._hotkey_stop)
+        cam_on = self.record_page.camera_enabled()
+        self._record_bar.set_camera_enabled(cam_on)
+        self._record_bar.set_camera_hidden(False, closed=False)
+        screen = screen_at_index(self.record_page.monitor_index())
+        self._record_bar.place_outside(rect, screen.geometry())
+        self._record_bar.show()
+        self._record_bar.raise_()
+        self._record_bar.start_clock()
+        if self._record_outline is None:
+            self._record_outline = RecordingOutline()
+        self._record_outline.show_around(rect)
+
+    def _start_camera(self, rect) -> None:
+        self._camera_closed = False
+        if not self.record_page.camera_enabled():
+            if self._camera_window:
+                self._camera_window.close_camera()
+            return
+        if self._camera_window is None:
+            self._camera_window = CameraWindow()
+        cam = self._camera_window
+        cam.configure(self.record_page.camera_shape(), self.record_page.camera_size())
+        data = load_settings()
+        x = int(data.get("record_camera_x", -1) or -1)
+        y = int(data.get("record_camera_y", -1) or -1)
+        size = self.record_page.camera_size()
+        if x >= 0 and y >= 0:
+            cam.move(x, y)
+        else:
+            cam.move(rect.right() - size - 16, rect.bottom() - size - 16)
+        if not cam.open_camera(self.record_page.camera_name()):
+            QMessageBox.warning(self, "Camera", "Could not open the selected camera.")
+            self._record_bar.set_camera_enabled(False) if self._record_bar else None
+
+    def _hide_camera(self) -> None:
+        if self._camera_window:
+            self._camera_window.hide_preview()
+        if self._record_bar:
+            self._record_bar.set_camera_hidden(True, closed=self._camera_closed)
+
+    def _show_camera(self) -> None:
+        if not self._camera_window:
+            self._start_camera(self._current_capture_rect())
+        elif not self._camera_window.show_preview():
+            QMessageBox.warning(self, "Camera", "Could not start the camera.")
+            return
+        self._camera_closed = False
+        if self._record_bar:
+            self._record_bar.set_camera_hidden(False, closed=False)
+
+    def _close_camera(self) -> None:
+        self._camera_closed = True
+        if self._camera_window:
+            self._camera_window.close_camera()
+        if self._record_bar:
+            self._record_bar.set_camera_hidden(True, closed=True)
+
+    def _hotkey_stop(self) -> None:
+        if self._recorder.running:
+            self._stop_recording()
+
+    def _watch_recorder(self) -> None:
+        if self._stopping_record:
+            return
+        if not self._recorder.process:
+            self._record_watch.stop()
+            return
+        if self._recorder.running:
+            return
+        if self._recorder.try_gdigrab_fallback():
+            return
+        message = self._recorder.early_error() or "Recording stopped unexpectedly."
+        self._record_watch.stop()
+        self._teardown_recording_ui()
+        QMessageBox.critical(self, "Record", message)
+
+    def _teardown_recording_ui(self) -> None:
+        self._record_watch.stop()
+        if self._stop_hotkey:
+            self._stop_hotkey.unregister()
+        if self._record_bar:
+            self._record_bar.stop_clock()
+            self._record_bar.hide()
+        if self._record_outline:
+            self._record_outline.hide()
+        if self._camera_window:
+            pos = self._camera_window.pos()
+            self.record_page.persist({"record_camera_x": pos.x(), "record_camera_y": pos.y()})
+            self._camera_window.close_camera()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _stop_recording(self, add_clip: bool = True) -> None:
+        self._stopping_record = True
+        self._starting_record = False
+        self._record_watch.stop()
+        if not self._recorder.running and not self._recorder.process:
+            self._teardown_recording_ui()
+            self._stopping_record = False
+            return
+        path = None
+        error = None
+        try:
+            path = self._recorder.stop()
+        except Exception as exc:
+            error = str(exc)
+        self._teardown_recording_ui()
+        self._stopping_record = False
+        if error:
+            QMessageBox.critical(self, "Record", error)
+            return
+        if add_clip and path:
+            self.mode_tabs.setCurrentIndex(1)
+            self._add_media([str(path)])
+            self._set_status(f"Added recording {path.name} to V1.")
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._recorder.running:
+            try:
+                self._stop_recording(add_clip=False)
+            except Exception:
+                pass
+        if self._region_frame:
+            self._region_frame.close()
+        if self._record_bar:
+            self._record_bar.close()
+        if self._camera_window:
+            self._camera_window.close_camera()
+            self._camera_window.close()
+        if self._stop_hotkey:
+            self._stop_hotkey.unregister()
         if self.worker and self.worker.isRunning():
             self.worker.terminate()
             self.worker.wait(2000)
         self._pause_all()
         self.player.stop()
         self._preview_player.stop()
-        self.narration_player.stop()
+        self.voice_sfx.stop()
         self.music_player.stop()
         event.accept()
