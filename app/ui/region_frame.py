@@ -14,30 +14,49 @@ HANDLE = 10
 MIN_W = 160
 MIN_H = 120
 BAR_H = 40
+# Keep overlay windows this far from recorded pixels. gdigrab/ddagrab paint
+# WDA_EXCLUDEFROMCAPTURE windows as solid black, so the controls must sit
+# fully outside the capture rect instead of being "excluded".
+GAP = 8
+MIN_CAPTURE = 80
 
 
-def exclude_from_capture(widget: QWidget) -> None:
+def _overlay_flags(*extra: Qt.WindowType) -> Qt.WindowType:
+    flags = (
+        Qt.WindowType.FramelessWindowHint
+        | Qt.WindowType.WindowStaysOnTopHint
+        | Qt.WindowType.Tool
+    )
+    no_shadow = getattr(Qt.WindowType, "NoDropShadowWindowHint", None)
+    if no_shadow is not None:
+        flags |= no_shadow
+    for flag in extra:
+        flags |= flag
+    return flags
+
+
+def _disable_shadow(widget: QWidget) -> None:
+    """Stop the DWM frame from extending into the recorded area."""
     if sys.platform != "win32":
         return
     try:
         hwnd = int(widget.winId())
-        ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+        dwm = ctypes.windll.dwmapi
+        disabled = ctypes.c_int(1)  # DWMNCRP_DISABLED
+        dwm.DwmSetWindowAttribute(hwnd, 2, ctypes.byref(disabled), ctypes.sizeof(disabled))
+        square = ctypes.c_int(1)  # DWMWCP_DONOTROUND
+        dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(square), ctypes.sizeof(square))
     except Exception:
         pass
 
 
 class OutlineStrip(QWidget):
-    """Red bar that is visible on screen but omitted from Windows capture."""
+    """Thin red edge drawn just outside the captured rectangle."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("recordingOutline")
-        flags = (
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
-            | Qt.WindowType.WindowTransparentForInput
-        )
+        flags = _overlay_flags(Qt.WindowType.WindowTransparentForInput)
         does_not_focus = getattr(Qt.WindowType, "WindowDoesNotAcceptFocus", None)
         if does_not_focus is not None:
             flags |= does_not_focus
@@ -49,8 +68,8 @@ class OutlineStrip(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        exclude_from_capture(self)
-        QTimer.singleShot(0, lambda: exclude_from_capture(self))
+        _disable_shadow(self)
+        QTimer.singleShot(0, lambda widget=self: _disable_shadow(widget))
 
 
 def screen_at_index(index: int) -> QScreen:
@@ -72,11 +91,8 @@ class RecordingBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("recordingBar")
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
-        )
+        self.setWindowFlags(_overlay_flags())
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setFixedHeight(BAR_H)
         self._elapsed = 0
         self._timer = QTimer(self)
@@ -111,7 +127,8 @@ class RecordingBar(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        exclude_from_capture(self)
+        _disable_shadow(self)
+        QTimer.singleShot(0, lambda widget=self: _disable_shadow(widget))
 
     def start_clock(self) -> None:
         self._elapsed = 0
@@ -131,20 +148,113 @@ class RecordingBar(QWidget):
         self.show_btn.setEnabled(hidden or closed)
         self.close_cam_btn.setEnabled(not closed)
 
-    def place_outside(self, hole: QRect, bounds: QRect) -> None:
-        width = max(420, self.sizeHint().width())
-        x = hole.x()
-        y = hole.y() - BAR_H - 8
-        if y < bounds.y():
-            y = hole.bottom() + 8
-        if y + BAR_H > bounds.bottom():
-            y = bounds.y() + 8
-            x = hole.right() + 8
-        if x + width > bounds.right():
-            x = bounds.right() - width - 8
-        x = max(bounds.x() + 8, x)
-        self.setFixedWidth(min(width, bounds.width() - 16))
-        self.move(x, y)
+    def place_outside(self, hole: QRect, bounds: QRect) -> QRect:
+        """Park the bar fully outside `hole`.
+
+        Returns the rectangle that should actually be recorded. When the bar
+        cannot fit on screen without covering `hole` (full screen), that
+        rectangle is trimmed so the bar sits in the margin and is not captured.
+        """
+        width = min(max(420, self.sizeHint().width()), max(160, bounds.width()))
+        self.setFixedSize(width, BAR_H)
+        hole = QRect(hole)
+
+        def clamp_x(preferred: int) -> int:
+            return max(bounds.left(), min(preferred, bounds.right() - width + 1))
+
+        def clamp_y(preferred: int) -> int:
+            return max(bounds.top(), min(preferred, bounds.bottom() - BAR_H + 1))
+
+        blocked = hole.adjusted(-GAP, -GAP, GAP, GAP)
+        x = clamp_x(hole.left())
+        y = clamp_y(hole.top())
+        candidates = (
+            QRect(x, hole.top() - BAR_H - GAP, width, BAR_H),
+            QRect(x, hole.bottom() + 1 + GAP, width, BAR_H),
+            QRect(hole.left() - width - GAP, y, width, BAR_H),
+            QRect(hole.right() + 1 + GAP, y, width, BAR_H),
+        )
+        for rect in candidates:
+            if bounds.contains(rect) and not rect.intersects(blocked):
+                self.setGeometry(rect)
+                return hole
+
+        # Full-screen (and other tight regions) have no free margin. Sit on the
+        # bottom edge and leave that band out of the recording so the panel
+        # does not cover the top of the desktop, and does not turn black.
+        carved = self._carve(hole, bounds, width, top=False)
+        if carved is None:
+            carved = self._carve(hole, bounds, width, top=True)
+        if carved is not None:
+            return carved
+
+        bar = QRect(clamp_x(bounds.left()), bounds.top(), width, BAR_H)
+        self.setGeometry(bar)
+        trimmed = QRect(hole)
+        trimmed.setTop(bar.bottom() + 1 + GAP)
+        if trimmed.height() >= MIN_CAPTURE and not bar.intersects(trimmed):
+            return trimmed
+        return hole
+
+    def _carve(self, hole: QRect, bounds: QRect, width: int, *, top: bool) -> QRect | None:
+        if hole.height() <= BAR_H + GAP + MIN_CAPTURE:
+            return None
+        x = max(bounds.left(), min(hole.left(), bounds.right() - width + 1))
+        new_hole = QRect(hole)
+        if top:
+            bar = QRect(x, max(bounds.top(), hole.top()), width, BAR_H)
+            new_hole.setTop(bar.bottom() + 1 + GAP)
+        else:
+            bar_y = min(hole.bottom(), bounds.bottom()) - BAR_H + 1
+            bar = QRect(x, max(bounds.top(), bar_y), width, BAR_H)
+            new_hole.setBottom(bar.top() - GAP - 1)
+        if new_hole.width() < MIN_W or new_hole.height() < MIN_CAPTURE:
+            return None
+        if not bounds.contains(bar) or bar.intersects(new_hole):
+            return None
+        self.setGeometry(bar)
+        return new_hole
+
+    def separate_from(self, hole: QRect, bounds: QRect) -> QRect:
+        """After show, keep the real window frame (including any border) out of `hole`."""
+        frame = self.frameGeometry()
+        if not frame.intersects(hole):
+            return hole
+        geo = QRect(self.geometry())
+        overlap = frame.intersected(hole)
+        vertical = abs(frame.center().y() - hole.center().y()) >= abs(frame.center().x() - hole.center().x())
+        if vertical:
+            if frame.center().y() <= hole.center().y():
+                geo.moveTop(geo.top() - overlap.height() - GAP)
+            else:
+                geo.moveTop(geo.top() + overlap.height() + GAP)
+        elif frame.center().x() <= hole.center().x():
+            geo.moveLeft(geo.left() - overlap.width() - GAP)
+        else:
+            geo.moveLeft(geo.left() + overlap.width() + GAP)
+        if bounds.contains(geo):
+            self.setGeometry(geo)
+            frame = self.frameGeometry()
+            if not frame.intersects(hole):
+                return hole
+        trimmed = QRect(hole)
+        frame = self.frameGeometry()
+        vertical = abs(frame.center().y() - hole.center().y()) >= abs(frame.center().x() - hole.center().x())
+        if vertical and frame.center().y() <= hole.center().y():
+            trimmed.setTop(frame.bottom() + 3)
+        elif vertical:
+            trimmed.setBottom(frame.top() - 3)
+        elif frame.center().x() <= hole.center().x():
+            trimmed.setLeft(frame.right() + 3)
+        else:
+            trimmed.setRight(frame.left() - 3)
+        if (
+            trimmed.width() >= MIN_W
+            and trimmed.height() >= MIN_CAPTURE
+            and not frame.intersects(trimmed)
+        ):
+            return trimmed
+        return hole
 
     def _tick(self) -> None:
         self._elapsed += 1
@@ -153,25 +263,54 @@ class RecordingBar(QWidget):
 
 
 class RecordingOutline:
-    """Red frame around the capture rect. Strips sit outside the hole and are
-    excluded from Windows capture so they do not appear in the recording."""
+    """Red frame around the capture rect. Strips stay outside the recorded pixels."""
 
     THICK = 4
 
     def __init__(self) -> None:
         self._strips = [OutlineStrip() for _ in range(4)]
+        self._hole = QRect()
+        self._bounds: QRect | None = None
 
-    def show_around(self, hole: QRect) -> None:
+    def show_around(self, hole: QRect, bounds: QRect | None = None) -> None:
         t = self.THICK
-        north, east, south, west = self._strips
-        north.setGeometry(hole.x() - t, hole.y() - t, hole.width() + t * 2, t)
-        south.setGeometry(hole.x() - t, hole.bottom() + 1, hole.width() + t * 2, t)
-        west.setGeometry(hole.x() - t, hole.y(), t, hole.height())
-        east.setGeometry(hole.right() + 1, hole.y(), t, hole.height())
+        gap = 2
+        self._hole = QRect(hole)
+        self._bounds = QRect(bounds) if bounds is not None else None
+        geos = (
+            QRect(hole.left() - t, hole.top() - t - gap, hole.width() + t * 2, t),
+            QRect(hole.right() + 1 + gap, hole.top(), t, hole.height()),
+            QRect(hole.left() - t, hole.bottom() + 1 + gap, hole.width() + t * 2, t),
+            QRect(hole.left() - t - gap, hole.top(), t, hole.height()),
+        )
+        for strip, geo in zip(self._strips, geos):
+            self._place_strip(strip, geo)
+        QTimer.singleShot(0, self._hide_overlapping)
+
+    def _place_strip(self, strip: OutlineStrip, geo: QRect) -> None:
+        hole = self._hole
+        bounds = self._bounds
+        if geo.intersects(hole) or (bounds is not None and not bounds.contains(geo)):
+            strip.hide()
+            return
+        strip.setGeometry(geo)
+        strip.show()
+        strip.raise_()
+        actual = strip.frameGeometry()
+        if actual.intersects(hole) or (bounds is not None and not bounds.contains(actual)):
+            strip.hide()
+
+    def _hide_overlapping(self) -> None:
+        hole = getattr(self, "_hole", None)
+        if hole is None:
+            return
+        bounds = self._bounds
         for strip in self._strips:
-            strip.show()
-            strip.raise_()
-            exclude_from_capture(strip)
+            if not strip.isVisible():
+                continue
+            actual = strip.frameGeometry()
+            if actual.intersects(hole) or (bounds is not None and not bounds.contains(actual)):
+                strip.hide()
 
     def hide(self) -> None:
         for strip in self._strips:
@@ -216,10 +355,6 @@ class RegionFrame(QWidget):
         self.start_btn.clicked.connect(lambda: self.startRequested.emit())
         self.cancel_btn.clicked.connect(lambda: self.cancelRequested.emit())
         self.toolbar.setFixedHeight(BAR_H)
-
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
-        exclude_from_capture(self)
 
     def attach_screen(self, index: int, hole: QRect | None = None) -> None:
         screen = screen_at_index(index)

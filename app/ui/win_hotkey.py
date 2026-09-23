@@ -7,47 +7,57 @@ from PySide6.QtCore import QAbstractNativeEventFilter, QObject, Signal
 from PySide6.QtWidgets import QApplication
 
 
-class WinStopHotkey(QObject, QAbstractNativeEventFilter):
-    pressed = Signal()
-    HOTKEY_ID = 0x71C0
+class WinRecordHotkeys(QObject, QAbstractNativeEventFilter):
+    """System-wide keys that work while this window is minimized."""
+
+    action = Signal(str)
     WM_HOTKEY = 0x0312
-    VK_F10 = 0x79
     MOD_NOREPEAT = 0x4000
+    # id, virtual key, action name
+    BINDS = (
+        (0x71C0, 0x79, "stop"),  # F10
+        (0x71C1, 0x77, "hide-camera"),  # F8
+        (0x71C2, 0x78, "show-camera"),  # F9
+        (0x71C3, 0x76, "close-camera"),  # F7
+    )
 
     def __init__(self, parent=None):
         QObject.__init__(self, parent)
         QAbstractNativeEventFilter.__init__(self)
-        self._registered = False
+        self._registered: set[int] = set()
 
     def register(self) -> bool:
         if sys.platform != "win32":
             return False
         self.unregister()
-        try:
-            ok = ctypes.windll.user32.RegisterHotKey(
-                None, self.HOTKEY_ID, self.MOD_NOREPEAT, self.VK_F10
-            )
-        except Exception:
-            return False
-        if not ok:
+        user32 = ctypes.windll.user32
+        for hotkey_id, vk, _name in self.BINDS:
+            try:
+                ok = user32.RegisterHotKey(None, hotkey_id, self.MOD_NOREPEAT, vk)
+            except Exception:
+                ok = False
+            if ok:
+                self._registered.add(hotkey_id)
+        if not self._registered:
             return False
         app = QApplication.instance()
         if app is not None:
             app.installNativeEventFilter(self)
-        self._registered = True
         return True
 
     def unregister(self) -> None:
         if not self._registered:
             return
-        try:
-            ctypes.windll.user32.UnregisterHotKey(None, self.HOTKEY_ID)
-        except Exception:
-            pass
+        user32 = ctypes.windll.user32
+        for hotkey_id in list(self._registered):
+            try:
+                user32.UnregisterHotKey(None, hotkey_id)
+            except Exception:
+                pass
+        self._registered.clear()
         app = QApplication.instance()
         if app is not None:
             app.removeNativeEventFilter(self)
-        self._registered = False
 
     def nativeEventFilter(self, eventType, message):
         kind = eventType if isinstance(eventType, (bytes, bytearray)) else str(eventType).encode()
@@ -59,7 +69,10 @@ class WinStopHotkey(QObject, QAbstractNativeEventFilter):
             msg = wintypes.MSG.from_address(int(message))
         except Exception:
             return False, 0
-        if msg.message == self.WM_HOTKEY and msg.wParam == self.HOTKEY_ID:
-            self.pressed.emit()
-            return True, 0
+        if msg.message != self.WM_HOTKEY or int(msg.wParam) not in self._registered:
+            return False, 0
+        for hotkey_id, _vk, name in self.BINDS:
+            if hotkey_id == int(msg.wParam):
+                self.action.emit(name)
+                return True, 0
         return False, 0

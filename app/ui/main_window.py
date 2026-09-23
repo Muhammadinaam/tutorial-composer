@@ -53,7 +53,7 @@ from app.engine.script import (
 from app.engine.settings import cache_dir, load_settings, save_settings
 from app.engine.timeline import TimelinePlan, build_timeline
 from app.engine.translate import LANGUAGE_NAMES, translate_cues
-from app.engine.tts import synthesize, synthesize_with_duration
+from app.engine.tts import is_cached, synthesize, synthesize_with_duration
 from app.engine.voices import (
     fallback_edge_voices,
     languages_from_voices,
@@ -62,11 +62,11 @@ from app.engine.voices import (
 )
 from app.ui.camera_window import CameraWindow
 from app.ui.record_page import RecordPage
-from app.ui.region_frame import RecordingBar, RecordingOutline, RegionFrame, screen_at_index
+from app.ui.region_frame import RegionFrame, screen_at_index
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.timeline_widget import TimelineWidget
 from app.ui.voice_cue import VoiceCuePlayer
-from app.ui.win_hotkey import WinStopHotkey
+from app.ui.win_hotkey import WinRecordHotkeys
 from app.ui.workers import TaskWorker
 
 
@@ -109,15 +109,15 @@ class MainWindow(QMainWindow):
         self._switching_lang = False
         self._recorder = ScreenRecorder()
         self._region_frame: RegionFrame | None = None
-        self._record_bar: RecordingBar | None = None
-        self._record_outline: RecordingOutline | None = None
+        self._record_bar = None
+        self._record_outline = None
         self._warming = False
         self._warmup_finishing = False
         self._sfx_play_when_ready = False
         self._sfx_stopping = False
         self._defer_video = False
         self._camera_window: CameraWindow | None = None
-        self._stop_hotkey: WinStopHotkey | None = None
+        self._stop_hotkey: WinRecordHotkeys | None = None
         self._region_full = True
         self._camera_closed = False
         self._stopping_record = False
@@ -505,13 +505,19 @@ class MainWindow(QMainWindow):
         self._warn_timer.setSingleShot(True)
         self._warn_timer.setInterval(400)
         self._warn_timer.timeout.connect(self.refresh_warnings)
-        self.record_page.startRequested.connect(self.start_recording)
+        self.record_page.startRequested.connect(self._record_button_clicked)
         self.record_page.selectAreaRequested.connect(self._select_record_area)
         self.record_page.fullScreenRequested.connect(self._use_full_screen_region)
         self.record_page.monitorChanged.connect(self._record_monitor_changed)
-        self._stop_shortcut = QShortcut(QKeySequence("F10"), self)
-        self._stop_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        self._stop_shortcut.activated.connect(self._hotkey_stop)
+        for key, slot in (
+            ("F10", self._hotkey_stop),
+            ("F8", self._hide_camera),
+            ("F9", self._show_camera),
+            ("F7", self._close_camera),
+        ):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            shortcut.activated.connect(slot)
         self._restore_record_region_label()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
@@ -2001,6 +2007,12 @@ class MainWindow(QMainWindow):
             bits.append(f"{len(self.tts_paths)} voice clip(s) ready on the VO track.")
         self.warning_label.setText("\n".join(bits))
 
+    def _voice_progress(self, index: int, total: int, text: str, data: dict, voice: str) -> str:
+        provider = data.get("tts_provider", "edge-tts")
+        if is_cached(text, provider=provider, voice=voice):
+            return f"Reusing saved audio for cue {index} of {total}..."
+        return f"Speaking cue {index} of {total}..."
+
     def preview_voice(self) -> None:
         voice = self.voice_combo.currentData()
         if not voice:
@@ -2056,7 +2068,7 @@ class MainWindow(QMainWindow):
             paths = []
             durations = []
             for i, cue in enumerate(cues, start=1):
-                progress(f"Speaking cue {i} of {len(cues)}...")
+                progress(self._voice_progress(i, len(cues), cue.text, data, voice))
                 path, duration = synthesize_with_duration(
                     cue.text,
                     provider=data.get("tts_provider", "edge-tts"),
@@ -2175,7 +2187,7 @@ class MainWindow(QMainWindow):
                 paths, durations = [], []
                 for i, cue in enumerate(cues, start=1):
                     pct = int((i - 1) / max(1, len(cues)) * voice_end)
-                    progress(f"Speaking cue {i} of {len(cues)}...", pct)
+                    progress(self._voice_progress(i, len(cues), cue.text, data, voice), pct)
                     path, duration = synthesize_with_duration(
                         cue.text,
                         provider=data.get("tts_provider", "edge-tts"),
@@ -2397,20 +2409,58 @@ class MainWindow(QMainWindow):
                 "No loopback device is selected. Turn off System audio or pick Stereo Mix / a virtual cable.",
             )
             return
-        self.record_page.persist()
-        rect = self._current_capture_rect()
         if self._region_frame:
             self._region_frame.hide()
+        self.raise_()
+        self.activateWindow()
+        if not self._confirm_record_shortcuts():
+            return
+        self.record_page.persist()
+        rect = self._current_capture_rect()
         self._starting_record = True
         self._pending_record_rect = rect
+        self.record_page.set_recording(True)
         self.showMinimized()
-        self._show_record_bar(rect)
         self._start_camera(rect)
         if self._stop_hotkey is None:
-            self._stop_hotkey = WinStopHotkey(self)
-            self._stop_hotkey.pressed.connect(self._hotkey_stop)
+            self._stop_hotkey = WinRecordHotkeys(self)
+            self._stop_hotkey.action.connect(self._on_record_hotkey)
         self._stop_hotkey.register()
         QTimer.singleShot(300, self._begin_ffmpeg_capture)
+
+    def _record_button_clicked(self) -> None:
+        if self._recorder.running or self._starting_record:
+            self._stop_recording()
+            return
+        self.start_recording()
+
+    def _confirm_record_shortcuts(self) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle("Recording")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("Controls stay off the screen so they are not captured.")
+        box.setInformativeText(
+            "F10    Stop recording\n"
+            "F8     Hide camera\n"
+            "F9     Show camera\n"
+            "F7     Close camera\n\n"
+            "You can also restore this window from the taskbar and click Stop recording."
+        )
+        box.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        ok = box.button(QMessageBox.StandardButton.Ok)
+        if ok is not None:
+            ok.setText("Start recording")
+        return box.exec() == QMessageBox.StandardButton.Ok
+
+    def _on_record_hotkey(self, name: str) -> None:
+        if name == "stop":
+            self._hotkey_stop()
+        elif name == "hide-camera":
+            self._hide_camera()
+        elif name == "show-camera":
+            self._show_camera()
+        elif name == "close-camera":
+            self._close_camera()
 
     def _begin_ffmpeg_capture(self) -> None:
         if not self._starting_record:
@@ -2432,28 +2482,7 @@ class MainWindow(QMainWindow):
             return
         self._record_watch.start()
         self._starting_record = False
-        self._set_status("Recording… F10 stops.")
-
-    def _show_record_bar(self, rect) -> None:
-        if self._record_bar is None:
-            self._record_bar = RecordingBar()
-            self._record_bar.stopRequested.connect(self._stop_recording)
-            self._record_bar.hideCameraRequested.connect(self._hide_camera)
-            self._record_bar.showCameraRequested.connect(self._show_camera)
-            self._record_bar.closeCameraRequested.connect(self._close_camera)
-            bar_stop = QShortcut(QKeySequence("F10"), self._record_bar)
-            bar_stop.activated.connect(self._hotkey_stop)
-        cam_on = self.record_page.camera_enabled()
-        self._record_bar.set_camera_enabled(cam_on)
-        self._record_bar.set_camera_hidden(False, closed=False)
-        screen = screen_at_index(self.record_page.monitor_index())
-        self._record_bar.place_outside(rect, screen.geometry())
-        self._record_bar.show()
-        self._record_bar.raise_()
-        self._record_bar.start_clock()
-        if self._record_outline is None:
-            self._record_outline = RecordingOutline()
-        self._record_outline.show_around(rect)
+        self._set_status("Recording… F10 stops, or restore this window and click Stop recording.")
 
     def _start_camera(self, rect) -> None:
         self._camera_closed = False
@@ -2475,33 +2504,37 @@ class MainWindow(QMainWindow):
             cam.move(rect.right() - size - 16, rect.bottom() - size - 16)
         if not cam.open_camera(self.record_page.camera_name()):
             QMessageBox.warning(self, "Camera", "Could not open the selected camera.")
-            self._record_bar.set_camera_enabled(False) if self._record_bar else None
+
+    def _record_keys_live(self) -> bool:
+        return bool(self._recorder.running or self._starting_record)
 
     def _hide_camera(self) -> None:
+        if not self._record_keys_live():
+            return
         if self._camera_window:
             self._camera_window.hide_preview()
-        if self._record_bar:
-            self._record_bar.set_camera_hidden(True, closed=self._camera_closed)
 
     def _show_camera(self) -> None:
-        if not self._camera_window:
-            self._start_camera(self._current_capture_rect())
-        elif not self._camera_window.show_preview():
+        if not self._record_keys_live():
+            return
+        if self._camera_window is None:
+            self._camera_window = CameraWindow()
+        cam = self._camera_window
+        cam.configure(self.record_page.camera_shape(), self.record_page.camera_size())
+        if not cam.show_preview() and not cam.open_camera(self.record_page.camera_name()):
             QMessageBox.warning(self, "Camera", "Could not start the camera.")
             return
         self._camera_closed = False
-        if self._record_bar:
-            self._record_bar.set_camera_hidden(False, closed=False)
 
     def _close_camera(self) -> None:
+        if not self._record_keys_live():
+            return
         self._camera_closed = True
         if self._camera_window:
             self._camera_window.close_camera()
-        if self._record_bar:
-            self._record_bar.set_camera_hidden(True, closed=True)
 
     def _hotkey_stop(self) -> None:
-        if self._recorder.running:
+        if self._record_keys_live():
             self._stop_recording()
 
     def _watch_recorder(self) -> None:
@@ -2532,11 +2565,14 @@ class MainWindow(QMainWindow):
             pos = self._camera_window.pos()
             self.record_page.persist({"record_camera_x": pos.x(), "record_camera_y": pos.y()})
             self._camera_window.close_camera()
+        self.record_page.set_recording(False)
         self.showNormal()
         self.raise_()
         self.activateWindow()
 
     def _stop_recording(self, add_clip: bool = True) -> None:
+        if self._stopping_record:
+            return
         self._stopping_record = True
         self._starting_record = False
         self._record_watch.stop()

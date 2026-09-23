@@ -35,8 +35,9 @@ class RecordPage(QWidget):
 
         hint = QLabel(
             "Pick a monitor, then Select area to resize the capture frame. "
-            "Start recording to minimize this window. A camera window stays on top "
-            "and is captured with the desktop. F10 stops."
+            "Start recording minimizes this window. Nothing from this app is drawn "
+            "on the capture. Shortcuts are shown before recording begins. "
+            "Restore this window from the taskbar to stop, the same way as OBS."
         )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
@@ -94,6 +95,7 @@ class RecordPage(QWidget):
         self.start_btn = QPushButton("Start recording")
         self.start_btn.setObjectName("accentButton")
         self.start_btn.setMinimumHeight(32)
+        self._recording = False
         self.platform_hint = QLabel()
         self.platform_hint.setObjectName("warningLabel")
         self.platform_hint.setWordWrap(True)
@@ -234,6 +236,15 @@ class RecordPage(QWidget):
         if extra:
             data.update(extra)
         save_settings(data)
+
+    def set_recording(self, active: bool) -> None:
+        self._recording = active
+        self.start_btn.setText("Stop recording" if active else "Start recording")
+        self.select_area_btn.setEnabled(not active)
+        self.full_screen_btn.setEnabled(not active)
+        self.monitor_combo.setEnabled(not active)
+        if sys.platform == "win32":
+            self.start_btn.setEnabled(True)
 
     def set_region_label(self, rect: QRect | None, full: bool = False) -> None:
         if full or rect is None:
