@@ -7,7 +7,36 @@ from PySide6.QtCore import QAbstractNativeEventFilter, QObject, Signal
 from PySide6.QtWidgets import QApplication
 
 
-class WinRecordHotkeys(QObject, QAbstractNativeEventFilter):
+def _event_bytes(eventType) -> bytes:
+    if isinstance(eventType, (bytes, bytearray)):
+        return bytes(eventType)
+    try:
+        return bytes(eventType)
+    except Exception:
+        return b""
+
+
+def _message_address(message) -> int | None:
+    if isinstance(message, int):
+        return message
+    try:
+        return int(message)
+    except Exception:
+        return None
+
+
+class _HotkeyFilter(QAbstractNativeEventFilter):
+    """Qt only dispatches this override when the class is not also a QObject."""
+
+    def __init__(self, owner: "WinRecordHotkeys"):
+        super().__init__()
+        self._owner = owner
+
+    def nativeEventFilter(self, eventType, message):
+        return self._owner.handle_native(eventType, message)
+
+
+class WinRecordHotkeys(QObject):
     """System-wide keys that work while this window is minimized."""
 
     action = Signal(str)
@@ -22,9 +51,10 @@ class WinRecordHotkeys(QObject, QAbstractNativeEventFilter):
     )
 
     def __init__(self, parent=None):
-        QObject.__init__(self, parent)
-        QAbstractNativeEventFilter.__init__(self)
+        super().__init__(parent)
         self._registered: set[int] = set()
+        self._filter = _HotkeyFilter(self)
+        self._installed = False
 
     def register(self) -> bool:
         if sys.platform != "win32":
@@ -41,32 +71,37 @@ class WinRecordHotkeys(QObject, QAbstractNativeEventFilter):
         if not self._registered:
             return False
         app = QApplication.instance()
-        if app is not None:
-            app.installNativeEventFilter(self)
+        if app is not None and not self._installed:
+            app.installNativeEventFilter(self._filter)
+            self._installed = True
         return True
 
     def unregister(self) -> None:
-        if not self._registered:
-            return
-        user32 = ctypes.windll.user32
-        for hotkey_id in list(self._registered):
-            try:
-                user32.UnregisterHotKey(None, hotkey_id)
-            except Exception:
-                pass
-        self._registered.clear()
-        app = QApplication.instance()
-        if app is not None:
-            app.removeNativeEventFilter(self)
+        if self._registered:
+            user32 = ctypes.windll.user32
+            for hotkey_id in list(self._registered):
+                try:
+                    user32.UnregisterHotKey(None, hotkey_id)
+                except Exception:
+                    pass
+            self._registered.clear()
+        if self._installed:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeNativeEventFilter(self._filter)
+            self._installed = False
 
-    def nativeEventFilter(self, eventType, message):
-        kind = eventType if isinstance(eventType, (bytes, bytearray)) else str(eventType).encode()
+    def handle_native(self, eventType, message):
+        kind = _event_bytes(eventType)
         if kind not in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
+            return False, 0
+        address = _message_address(message)
+        if not address:
             return False, 0
         try:
             from ctypes import wintypes
 
-            msg = wintypes.MSG.from_address(int(message))
+            msg = wintypes.MSG.from_address(address)
         except Exception:
             return False, 0
         if msg.message != self.WM_HOTKEY or int(msg.wParam) not in self._registered:

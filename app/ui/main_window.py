@@ -3,12 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from time import monotonic
 
-from PySide6.QtCore import QRect, QUrl, Qt, QTimer
+from PySide6.QtCore import QEvent, QRect, QUrl, Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent, QKeyEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -16,8 +18,10 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSlider,
@@ -27,6 +31,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTabBar,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -233,7 +238,9 @@ class MainWindow(QMainWindow):
         preview_box.setSpacing(4)
         self.preview_stack = QStackedWidget()
         self.video_widget = QVideoWidget()
+        self.video_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.image_label = QLabel("Add a video or image to the timeline")
+        self.image_label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setObjectName("hintLabel")
         self.image_label.setMinimumHeight(140)
@@ -518,42 +525,77 @@ class MainWindow(QMainWindow):
             shortcut = QShortcut(QKeySequence(key), self)
             shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
             shortcut.activated.connect(slot)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self._restore_record_region_label()
 
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
+            if self._handle_editor_shortcut(event):
+                return True
+        return False
+
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        if self.cue_table.hasFocus() or self.voice_combo.hasFocus() or self.lang_combo.hasFocus():
-            super().keyPressEvent(event)
-            return
-        key = event.key()
-        if key == Qt.Key.Key_I:
-            self.mark_in()
-            event.accept()
-            return
-        if key == Qt.Key.Key_O:
-            self.mark_out()
-            event.accept()
-            return
-        if key == Qt.Key.Key_Space:
-            self.toggle_play()
-            event.accept()
-            return
-        if key == Qt.Key.Key_S:
-            self.split_at_playhead()
-            event.accept()
-            return
-        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-            self.remove_clip()
-            event.accept()
-            return
-        if key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
-            self.timeline.zoom_by(1.25)
-            event.accept()
-            return
-        if key == Qt.Key.Key_Minus:
-            self.timeline.zoom_by(0.8)
+        if self._handle_editor_shortcut(event):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def _typing_focus(self) -> bool:
+        widget = QApplication.focusWidget()
+        if widget is None:
+            return False
+        if isinstance(widget, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox)):
+            return True
+        if self.cue_table.state() == QAbstractItemView.State.EditingState:
+            return True
+        return bool(widget is not self.cue_table and self.cue_table.isAncestorOf(widget))
+
+    def _handle_editor_shortcut(self, event: QKeyEvent) -> bool:
+        if not self.isActiveWindow() or self._typing_focus():
+            return False
+        mods = event.modifiers()
+        if mods & (
+            Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.AltModifier
+            | Qt.KeyboardModifier.MetaModifier
+        ):
+            return False
+        key = event.key()
+        zoom = key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal, Qt.Key.Key_Minus)
+        if event.isAutoRepeat() and not zoom:
+            return key in (
+                Qt.Key.Key_I,
+                Qt.Key.Key_O,
+                Qt.Key.Key_Space,
+                Qt.Key.Key_S,
+                Qt.Key.Key_Delete,
+                Qt.Key.Key_Backspace,
+            )
+        if key == Qt.Key.Key_Space and self.cue_table.hasFocus():
+            item = self.cue_table.currentItem()
+            if item is not None and item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                return False
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self.cue_table.hasFocus():
+            return False
+        if key == Qt.Key.Key_I:
+            self.mark_in()
+        elif key == Qt.Key.Key_O:
+            self.mark_out()
+        elif key == Qt.Key.Key_Space:
+            self.toggle_play()
+        elif key == Qt.Key.Key_S:
+            self.split_at_playhead()
+        elif key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.remove_clip()
+        elif key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+            self.timeline.zoom_by(1.25)
+        elif key == Qt.Key.Key_Minus:
+            self.timeline.zoom_by(0.8)
+        else:
+            return False
+        return True
 
     def _busy(self) -> bool:
         return self.worker is not None and self.worker.isRunning()
@@ -1407,8 +1449,12 @@ class MainWindow(QMainWindow):
     def _cue_index_at(self, moment: float, lead: float = 0.0) -> int | None:
         if not self.plan or len(self.tts_paths) != len(self.plan.cues):
             return None
+        # Cues stay "current" for their whole speech length, so a later line's
+        # start can still sit inside an earlier line's window. After a line
+        # finishes — especially a Stop-video line, whose playhead never moved —
+        # do not fall back to that earlier line or the playhead jumps to it.
         for index, cue in enumerate(self.plan.cues):
-            if index == self._narration_finished:
+            if index <= self._narration_finished:
                 continue
             start = cue.video_time
             end = start + max(0.05, cue.tts_duration)
@@ -2611,6 +2657,9 @@ class MainWindow(QMainWindow):
             self._camera_window.close()
         if self._stop_hotkey:
             self._stop_hotkey.unregister()
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         if self.worker and self.worker.isRunning():
             self.worker.terminate()
             self.worker.wait(2000)
