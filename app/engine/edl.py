@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from app.engine.ffmpeg import media_info
-from app.engine.project import IMAGE_EXTS, Clip, Cue, new_id
+from app.engine.project import IMAGE_EXTS, BlurRegion, Clip, Cue, new_id
 
 DEFAULT_IMAGE_SECONDS = 5.0
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".wma"}
@@ -132,6 +132,41 @@ def ripple_cues(cues: list[Cue], start: float, end: float) -> list[Cue]:
             )
         elif cue.video_time < lo + 0.001:
             result.append(cue)
+    return result
+
+
+def ripple_blurs(blurs: list[BlurRegion], start: float, end: float) -> list[BlurRegion]:
+    lo, hi = (min(start, end), max(start, end))
+    gap = hi - lo
+    if gap < 0.05:
+        return list(blurs)
+    result: list[BlurRegion] = []
+    for blur in blurs:
+        b0, b1 = float(blur.start), float(blur.end)
+        if b1 <= lo + 0.001:
+            result.append(blur)
+            continue
+        if b0 >= hi - 0.001:
+            shifted = replace(blur, start=max(0.0, b0 - gap), end=max(0.08, b1 - gap))
+            shifted.clamp()
+            result.append(shifted)
+            continue
+        kept_start = b0 if b0 < lo - 0.001 else None
+        kept_end = b1 - gap if b1 > hi + 0.001 else None
+        if kept_start is not None and kept_end is not None:
+            merged = replace(blur, start=kept_start, end=kept_end)
+            merged.clamp()
+            result.append(merged)
+            continue
+        if kept_start is not None and lo - kept_start >= 0.05:
+            trimmed = replace(blur, start=kept_start, end=lo)
+            trimmed.clamp()
+            result.append(trimmed)
+            continue
+        if kept_end is not None and kept_end - lo >= 0.05:
+            trimmed = replace(blur, start=lo, end=kept_end)
+            trimmed.clamp()
+            result.append(trimmed)
     return result
 
 

@@ -4,9 +4,8 @@ from pathlib import Path
 from time import monotonic
 
 from PySide6.QtCore import QEvent, QRect, QUrl, Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QKeyEvent, QKeySequence, QPixmap, QShortcut
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtGui import QAction, QCloseEvent, QKeyEvent, QKeySequence, QShortcut
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
@@ -26,7 +25,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSplitter,
-    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTabBar,
@@ -41,6 +39,7 @@ from app.engine.edl import (
     clip_joined_start,
     delete_joined_range,
     joined_duration,
+    ripple_blurs,
     ripple_cues,
     map_joined_to_clip,
     probe_audio,
@@ -49,7 +48,7 @@ from app.engine.edl import (
 )
 from app.engine.export import export_project
 from app.engine.ffmpeg import ffmpeg_available
-from app.engine.project import Cue, Narration, Project, load_project, save_project
+from app.engine.project import BlurRegion, Cue, Narration, Project, clamp_speed, load_project, save_project
 from app.engine.script import (
     estimate_speech_seconds,
     format_timestamp,
@@ -66,6 +65,7 @@ from app.engine.voices import (
     matching_voice,
 )
 from app.ui.camera_window import CameraWindow
+from app.ui.preview_canvas import PreviewCanvas
 from app.ui.record_page import RecordPage
 from app.ui.region_frame import RegionFrame, screen_at_index
 from app.ui.settings_dialog import SettingsDialog
@@ -109,6 +109,7 @@ class MainWindow(QMainWindow):
         self._music_lead = 0.0
         self._joining = False
         self._music_selected = False
+        self._selected_blur_id = ""
         self.tts_store: dict[str, tuple] = {}
         self._loading_table = False
         self._switching_lang = False
@@ -236,21 +237,14 @@ class MainWindow(QMainWindow):
         preview_box = QVBoxLayout(preview)
         preview_box.setContentsMargins(8, 8, 8, 8)
         preview_box.setSpacing(4)
-        self.preview_stack = QStackedWidget()
-        self.video_widget = QVideoWidget()
-        self.video_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.image_label = QLabel("Add a video or image to the timeline")
-        self.image_label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setObjectName("hintLabel")
-        self.image_label.setMinimumHeight(140)
-        self.preview_stack.addWidget(self.video_widget)
-        self.preview_stack.addWidget(self.image_label)
+        self.preview = PreviewCanvas()
+        self.video_sink = QVideoSink(self)
+        self.video_sink.videoFrameChanged.connect(self._on_video_frame)
         self.player = QMediaPlayer(self)
         self.audio_out = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_out)
-        self.player.setVideoOutput(self.video_widget)
-        preview_box.addWidget(self.preview_stack, 1)
+        self.player.setVideoOutput(self.video_sink)
+        preview_box.addWidget(self.preview, 1)
 
         controls = QHBoxLayout()
         self.play_btn = QPushButton("Play")
@@ -272,6 +266,19 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.play_btn)
         controls.addWidget(self.play_busy)
         controls.addWidget(self.time_label)
+        controls.addSpacing(8)
+        controls.addWidget(QLabel("Speed"))
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speed_slider.setRange(25, 200)
+        self.speed_slider.setSingleStep(5)
+        self.speed_slider.setPageStep(5)
+        self.speed_slider.setValue(100)
+        self.speed_slider.setFixedWidth(120)
+        self.speed_slider.setToolTip("Preview and export speed. 100% is normal. 50% is half speed.")
+        self.speed_label = QLabel("100%")
+        self.speed_label.setMinimumWidth(42)
+        controls.addWidget(self.speed_slider)
+        controls.addWidget(self.speed_label)
         controls.addStretch()
         controls.addWidget(self.mute_box)
         preview_box.addLayout(controls)
@@ -373,10 +380,15 @@ class MainWindow(QMainWindow):
         self.split_btn.setToolTip("Cut the selected clip at the red playhead (S)")
         self.mark_in_btn = QPushButton("Mark In")
         self.mark_out_btn = QPushButton("Mark Out")
+        self.blur_btn = QPushButton("Blur")
+        self.blur_btn.setCheckable(True)
+        self.blur_btn.setToolTip(
+            "Drag on the preview to cover part of the picture. Drag the purple bar on V1 to choose when it shows."
+        )
         self.delete_range_btn = QPushButton("Delete In→Out")
         self.delete_range_btn.setToolTip("Ripple-delete the middle between yellow marks.")
         self.delete_btn = QPushButton("Delete clip")
-        self.delete_btn.setToolTip("Remove the selected video/image piece, or selected music.")
+        self.delete_btn.setToolTip("Remove the selected blur, video, image, or music.")
         for btn in (
             self.add_video_btn,
             self.add_image_btn,
@@ -385,6 +397,7 @@ class MainWindow(QMainWindow):
             self.split_btn,
             self.mark_in_btn,
             self.mark_out_btn,
+            self.blur_btn,
             self.delete_range_btn,
             self.delete_btn,
         ):
@@ -432,6 +445,7 @@ class MainWindow(QMainWindow):
         self.timeline = TimelineWidget()
         self.timeline.setToolTip(
             "Mark In / Mark Out / Delete In→Out to cut the middle. "
+            "Blur, then drag on the preview. Drag a purple bar to change when the blur shows. "
             "Or Split twice and Delete clip. Drag the red line to scrub."
         )
         tl_box.addWidget(self.timeline)
@@ -484,7 +498,15 @@ class MainWindow(QMainWindow):
         self.split_btn.clicked.connect(self.split_at_playhead)
         self.mark_in_btn.clicked.connect(self.mark_in)
         self.mark_out_btn.clicked.connect(self.mark_out)
+        self.blur_btn.toggled.connect(self._blur_tool_toggled)
         self.delete_range_btn.clicked.connect(self.delete_marked_range)
+        self.preview.gestureStarted.connect(self._pause_for_blur_edit)
+        self.preview.blurDrawn.connect(self._add_blur_from_draw)
+        self.preview.blurSelected.connect(self._on_blur_selected)
+        self.preview.blurRectEdited.connect(self._blur_rect_edited)
+        self.timeline.blurSelected.connect(self._on_blur_selected)
+        self.timeline.blurEdited.connect(self._on_blur_edited)
+        self.speed_slider.valueChanged.connect(self._speed_changed)
         self.add_cue_btn.clicked.connect(self.add_cue_at_playhead)
         self.remove_cue_btn.clicked.connect(self.remove_selected_cue)
         self.cue_table.itemChanged.connect(self._table_changed)
@@ -867,6 +889,7 @@ class MainWindow(QMainWindow):
             self.selected_index = 0
         self._restore_tts()
         self._refresh_music_ui()
+        self._sync_speed_slider()
         self.refresh_timeline()
         self.refresh_warnings()
         self._refresh_transport()
@@ -888,8 +911,15 @@ class MainWindow(QMainWindow):
             extra_end=self._cue_end(),
             mark_in=self.project.mark_in,
             mark_out=self.project.mark_out,
+            blurs=self.project.blurs,
+            selected_blur=self._selected_blur_id,
         )
-        if self._music_selected and self.project.music_path:
+        blur = self._selected_blur()
+        if blur:
+            self.selected_label.setText(
+                f"Blur {format_timestamp(blur.start)}–{format_timestamp(blur.end)}"
+            )
+        elif self._music_selected and self.project.music_path:
             self.selected_label.setText(f"Music: {Path(self.project.music_path).name}")
         else:
             clip = self.current_clip()
@@ -920,6 +950,7 @@ class MainWindow(QMainWindow):
         self.slider.blockSignals(False)
         self.time_label.setText(f"{format_timestamp(self.playhead)} / {format_timestamp(total)}")
         self.timeline.set_playhead(self.playhead)
+        self._sync_preview_overlays()
 
     def _apply_mute(self) -> None:
         muted = bool(self.project.mute_original)
@@ -939,6 +970,7 @@ class MainWindow(QMainWindow):
 
     def _timeline_clip_selected(self, index: int) -> None:
         self._music_selected = False
+        self._selected_blur_id = ""
         self.selected_index = index
         clip = self.current_clip()
         if clip:
@@ -947,6 +979,7 @@ class MainWindow(QMainWindow):
 
     def _music_track_selected(self) -> None:
         self._music_selected = True
+        self._selected_blur_id = ""
         self.selected_index = -1
         if self.project.music_path:
             self.selected_label.setText(f"Music: {Path(self.project.music_path).name}")
@@ -1023,9 +1056,7 @@ class MainWindow(QMainWindow):
     def _show_current_media(self, force: bool = False, playback_join: bool = False) -> None:
         if not self.project.clips:
             self.player.stop()
-            self.preview_stack.setCurrentWidget(self.image_label)
-            self.image_label.setText("Add a video or image to the timeline")
-            self.image_label.setPixmap(QPixmap())
+            self.preview.show_placeholder("Add a video or image to the timeline")
             return
         index = self.selected_index
         if index < 0 or index >= len(self.project.clips):
@@ -1040,24 +1071,13 @@ class MainWindow(QMainWindow):
         self.selected_index = index
         if clip.is_image:
             self.player.pause()
-            pixmap = QPixmap(clip.path)
-            if not pixmap.isNull():
-                self.image_label.setPixmap(
-                    pixmap.scaled(
-                        self.image_label.size(),
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                )
-                self.image_label.setText("")
-            else:
-                self.image_label.setText(clip.name)
-            self.preview_stack.setCurrentWidget(self.image_label)
+            self.preview.show_image(clip.path, fallback=clip.name)
             return
-        self.preview_stack.setCurrentWidget(self.video_widget)
         url = QUrl.fromLocalFile(str(Path(clip.path).resolve()))
+        source_changed = self.player.source() != url
+        self.preview.show_video(clear=source_changed)
         target_ms = int(local * 1000)
-        if self.player.source() != url:
+        if source_changed:
             self._begin_seek(target_ms, 250 if playback_join else 400)
             self.player.setSource(url)
             self.player.setPosition(target_ms)
@@ -1066,6 +1086,7 @@ class MainWindow(QMainWindow):
                 self._begin_seek(target_ms)
             self.player.setPosition(target_ms)
         self._apply_mute()
+        self._apply_playback_rate()
         if self._video_should_run() and not getattr(self, "_defer_video", False):
             self.player.play()
 
@@ -1139,6 +1160,9 @@ class MainWindow(QMainWindow):
             self._set_status(f"Added {len(files)} clip(s) on V1.")
 
     def remove_clip(self) -> None:
+        if self._selected_blur_id:
+            self._delete_selected_blur()
+            return
         if self._music_selected:
             self.remove_music()
             return
@@ -1263,6 +1287,7 @@ class MainWindow(QMainWindow):
         self._launch_playback()
 
     def _launch_playback(self) -> None:
+        self._apply_playback_rate()
         self._playing = True
         self._set_play_busy(False, "Pause")
         self._apply_mute()
@@ -1303,7 +1328,7 @@ class MainWindow(QMainWindow):
     def _tick_image(self) -> None:
         if not self._playing or self._audio_hold or self._waiting_for_voice or self._video_frozen:
             return
-        self.playhead += 0.033
+        self.playhead += 0.033 * self._playback_rate()
         total = joined_duration(self.project.clips)
         if self.playhead >= total:
             self.playhead = total
@@ -1534,7 +1559,7 @@ class MainWindow(QMainWindow):
         if self._video_frozen and self._freeze_index == index:
             return
         if self._video_frozen and self._freeze_clock:
-            self._music_lead += max(0.0, monotonic() - self._freeze_clock)
+            self._music_lead += self._freeze_media_elapsed()
         self._video_frozen = True
         self._freeze_index = index
         self._freeze_clock = monotonic()
@@ -1553,7 +1578,7 @@ class MainWindow(QMainWindow):
             self._freeze_timer.stop()
             return
         if self._freeze_clock:
-            self._music_lead += max(0.0, monotonic() - self._freeze_clock)
+            self._music_lead += self._freeze_media_elapsed()
         self._discard_video_freeze()
         if resume and self._playing and not self._scrubbing and not self._audio_hold:
             self._resume_transport()
@@ -1764,7 +1789,7 @@ class MainWindow(QMainWindow):
         length = self.project.music_duration or 0.0
         moment = self.playhead + self._music_lead
         if self._video_frozen and self._freeze_clock:
-            moment += max(0.0, monotonic() - self._freeze_clock)
+            moment += self._freeze_media_elapsed()
         offset = moment % length if length > 0.05 else moment
         if self._video_frozen and not force:
             self.music_audio.setVolume(self.project.music_volume)
@@ -1969,6 +1994,144 @@ class MainWindow(QMainWindow):
         else:
             self._rebuild_lang_tabs()
 
+    def _playback_rate(self) -> float:
+        return clamp_speed(getattr(self.project, "speed", 1.0))
+
+    def _freeze_media_elapsed(self) -> float:
+        if not self._freeze_clock:
+            return 0.0
+        return max(0.0, monotonic() - self._freeze_clock) * self._playback_rate()
+
+    def _apply_playback_rate(self) -> None:
+        rate = self._playback_rate()
+        self.player.setPlaybackRate(rate)
+        self.music_player.setPlaybackRate(rate)
+        self.voice_sfx.setPlaybackRate(rate)
+
+    def _sync_speed_slider(self) -> None:
+        percent = int(round(self._playback_rate() * 100))
+        percent = max(25, min(200, int(round(percent / 5.0) * 5)))
+        self.project.speed = percent / 100.0
+        self.speed_slider.blockSignals(True)
+        self.speed_slider.setValue(percent)
+        self.speed_slider.blockSignals(False)
+        self.speed_label.setText(f"{percent}%")
+        self._apply_playback_rate()
+
+    def _speed_changed(self, value: int) -> None:
+        snapped = max(25, min(200, int(round(int(value) / 5.0) * 5)))
+        if snapped != value:
+            self.speed_slider.blockSignals(True)
+            self.speed_slider.setValue(snapped)
+            self.speed_slider.blockSignals(False)
+        self.project.speed = snapped / 100.0
+        self.speed_label.setText(f"{snapped}%")
+        self._apply_playback_rate()
+
+    def _on_video_frame(self, frame) -> None:
+        if self.preview.mode != "video":
+            return
+        image = frame.toImage()
+        if image.isNull():
+            return
+        self.preview.set_frame(image.copy())
+
+    def _selected_blur(self) -> BlurRegion | None:
+        for blur in self.project.blurs:
+            if blur.id == self._selected_blur_id:
+                return blur
+        return None
+
+    def _sync_preview_overlays(self) -> None:
+        if not hasattr(self, "preview"):
+            return
+        self.preview.set_regions(self.project.blurs, self._selected_blur_id, self.playhead)
+
+    def _blur_tool_toggled(self, on: bool) -> None:
+        self.preview.set_draw_mode(on)
+        if on:
+            self._set_status("Drag on the preview to blur part of the picture.")
+        else:
+            self._set_status("Blur tool off.")
+
+    def _pause_for_blur_edit(self) -> None:
+        if self._playing or self._warming:
+            self._pause_all()
+
+    def _add_blur_from_draw(self, x: float, y: float, w: float, h: float) -> None:
+        total = joined_duration(self.project.clips)
+        if total <= 0:
+            self._set_status("Add a video before drawing a blur.")
+            return
+        mark_in = self.project.mark_in
+        mark_out = self.project.mark_out
+        if mark_in is not None and mark_out is not None and abs(mark_out - mark_in) >= 0.08:
+            start, end = (min(mark_in, mark_out), max(mark_in, mark_out))
+        else:
+            start = self.playhead
+            end = start + 3.0
+        start = max(0.0, min(total, start))
+        end = max(0.0, min(total, end))
+        if end - start < 0.08:
+            if start + 0.08 <= total:
+                end = start + 0.08
+            else:
+                end = total
+                start = max(0.0, end - 0.08)
+        region = BlurRegion(start=start, end=end, x=x, y=y, w=w, h=h)
+        region.clamp()
+        region.end = min(total, region.end)
+        if region.end - region.start < 0.08:
+            region.start = max(0.0, region.end - 0.08)
+        self.project.blurs.append(region)
+        self._selected_blur_id = region.id
+        if self.playhead < region.start - 0.001 or self.playhead > region.end + 0.001:
+            self._seek_joined(region.start)
+        else:
+            self.refresh_timeline()
+            self._sync_preview_overlays()
+        self._set_status(
+            f"Blur from {format_timestamp(region.start)} to {format_timestamp(region.end)}. "
+            "Drag its bar on V1 to change the time."
+        )
+
+    def _on_blur_selected(self, blur_id: str) -> None:
+        self._selected_blur_id = blur_id or ""
+        if blur_id:
+            self._music_selected = False
+        self.refresh_timeline()
+        self._sync_preview_overlays()
+
+    def _on_blur_edited(self) -> None:
+        self._sync_preview_overlays()
+        blur = self._selected_blur()
+        if blur:
+            self.selected_label.setText(
+                f"Blur {format_timestamp(blur.start)}–{format_timestamp(blur.end)}"
+            )
+
+    def _blur_rect_edited(self, blur_id: str, x: float, y: float, w: float, h: float) -> None:
+        for blur in self.project.blurs:
+            if blur.id == blur_id:
+                blur.x, blur.y, blur.w, blur.h = x, y, w, h
+                break
+        self._selected_blur_id = blur_id
+        self._sync_preview_overlays()
+
+    def _delete_selected_blur(self) -> bool:
+        blur_id = self._selected_blur_id
+        if not blur_id:
+            return False
+        before = len(self.project.blurs)
+        self.project.blurs = [blur for blur in self.project.blurs if blur.id != blur_id]
+        self._selected_blur_id = ""
+        if len(self.project.blurs) == before:
+            return False
+        self.refresh_timeline()
+        self._sync_preview_overlays()
+        self._set_status("Blur removed.")
+        return True
+
     def mark_in(self) -> None:
         self.project.mark_in = self.playhead
         self.refresh_timeline()
@@ -1995,6 +2158,9 @@ class MainWindow(QMainWindow):
         self.project.clips = delete_joined_range(self.project.clips, lo, hi)
         for narration in self.project.narrations.values():
             narration.cues = ripple_cues(narration.cues, lo, hi)
+        self.project.blurs = ripple_blurs(self.project.blurs, lo, hi)
+        if self._selected_blur_id and not self._selected_blur():
+            self._selected_blur_id = ""
         self.project.sync_from_current()
         self.project.mark_in = None
         self.project.mark_out = None
@@ -2283,6 +2449,8 @@ class MainWindow(QMainWindow):
         self.playhead = 0.0
         self.selected_index = -1
         self._music_selected = False
+        self._selected_blur_id = ""
+        self.blur_btn.setChecked(False)
         self._pause_all()
         self.player.stop()
         self.music_player.stop()
@@ -2306,6 +2474,8 @@ class MainWindow(QMainWindow):
         self.playhead = 0.0
         self.selected_index = 0 if self.project.clips else -1
         self._music_selected = False
+        self._selected_blur_id = ""
+        self.blur_btn.setChecked(False)
         self.refresh_all()
         self._set_status(f"Opened {Path(path).name}")
 

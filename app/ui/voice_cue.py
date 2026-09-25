@@ -27,6 +27,7 @@ class VoiceCuePlayer(QObject):
         self._heard = False
         self._seen_start = False
         self._gain = 1.0
+        self._rate = 1.0
 
     def source(self) -> QUrl:
         return self._player.source()
@@ -47,6 +48,10 @@ class VoiceCuePlayer(QObject):
             and self._player.position() > 40
         )
 
+    def setPlaybackRate(self, rate: float) -> None:
+        self._rate = max(0.25, min(2.0, float(rate)))
+        self._player.setPlaybackRate(self._rate)
+
     def setVolume(self, gain: float) -> None:
         self._gain = max(0.0, min(1.0, float(gain)))
         self._audio.setMuted(False)
@@ -63,6 +68,7 @@ class VoiceCuePlayer(QObject):
         self._heard = False
         self._seen_start = False
         self._player.setPosition(0)
+        self._player.setPlaybackRate(self._rate)
         self._player.play()
 
     def stop(self) -> None:

@@ -5,7 +5,7 @@ from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen, QWheelEven
 from PySide6.QtWidgets import QScrollArea, QWidget
 
 from app.engine.edl import clip_joined_start, joined_duration, trim_clip
-from app.engine.project import Clip
+from app.engine.project import BlurRegion, Clip
 from app.engine.script import format_timestamp
 
 
@@ -15,6 +15,8 @@ class TimelineCanvas(QWidget):
     playheadReleased = Signal(float)
     clipsTrimmed = Signal()
     musicSelected = Signal()
+    blurSelected = Signal(str)
+    blurEdited = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -30,6 +32,8 @@ class TimelineCanvas(QWidget):
         self.extra_end = 0.0
         self.mark_in = None
         self.mark_out = None
+        self.blurs: list[BlurRegion] = []
+        self.selected_blur = ""
         self.left_gutter = 40
         self.ruler_h = 16
         self.track_h = 34
@@ -48,6 +52,8 @@ class TimelineCanvas(QWidget):
         extra_end: float = 0.0,
         mark_in: float | None = None,
         mark_out: float | None = None,
+        blurs: list[BlurRegion] | None = None,
+        selected_blur: str = "",
     ) -> None:
         self.clips = clips
         self.selected = selected
@@ -59,6 +65,8 @@ class TimelineCanvas(QWidget):
         self.extra_end = extra_end
         self.mark_in = mark_in
         self.mark_out = mark_out
+        self.blurs = list(blurs or [])
+        self.selected_blur = selected_blur or ""
         self._refresh_size()
         self.update()
 
@@ -141,12 +149,23 @@ class TimelineCanvas(QWidget):
 
         for index, clip in enumerate(self.clips):
             rect = self._clip_rect(index)
-            selected = index == self.selected and not self.music_selected
+            selected = index == self.selected and not self.music_selected and not self.selected_blur
             if clip.is_image:
                 fill = QColor("#c4922a") if selected else QColor("#8a6a2d")
             else:
                 fill = QColor("#3d8fd1") if selected else QColor("#2c5f8a")
             self._draw_block(painter, rect, fill, selected, f"{'IMG' if clip.is_image else 'VID'}  {clip.name}", format_timestamp(clip.used))
+
+        for blur in self.blurs:
+            rect = self._blur_bar_rect(blur)
+            selected = blur.id == self.selected_blur
+            painter.setBrush(QColor(176, 112, 230, 210) if selected else QColor(120, 70, 180, 170))
+            painter.setPen(QPen(QColor("#ffffff") if selected else QColor("#2a1238"), 1))
+            painter.drawRoundedRect(rect, 3, 3)
+            if rect.width() > 36:
+                painter.setPen(QColor("#ffffff"))
+                painter.setFont(QFont("Segoe UI", 7, QFont.Weight.DemiBold))
+                painter.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter, "Blur")
 
         vo = self._track_rect(1)
         if not self.cue_spans:
@@ -209,6 +228,53 @@ class TimelineCanvas(QWidget):
         painter.setPen(QColor("#e8e8e8"))
         painter.drawText(rect.adjusted(5, 14, -5, -2), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, subtitle)
 
+    def _blur_bar_rect(self, blur: BlurRegion) -> QRect:
+        track = self._track_rect(0)
+        x = self._time_to_x(blur.start)
+        width = max(8, int((blur.end - blur.start) * self.pps))
+        height = 14
+        return QRect(x, track.bottom() - height - 1, width, height)
+
+    def _hit_blur(self, pos) -> tuple[BlurRegion, str] | None:
+        for blur in reversed(self.blurs):
+            rect = self._blur_bar_rect(blur)
+            if not rect.contains(pos):
+                continue
+            edge = 6 if rect.width() > 18 else 0
+            if edge and pos.x() <= rect.left() + edge:
+                return blur, "left"
+            if edge and pos.x() >= rect.right() - edge:
+                return blur, "right"
+            return blur, "body"
+        return None
+
+    def _apply_blur_drag(self, time: float) -> None:
+        blur = next((item for item in self.blurs if item.id == self._drag["id"]), None)
+        if blur is None:
+            return
+        limit = joined_duration(self.clips)
+        if limit <= 0.1:
+            return
+        mode = self._drag["mode"]
+        origin = self._drag["time"]
+        start = float(self._drag["start"])
+        end = float(self._drag["end"])
+        minimum = 0.08
+        if mode == "blur-left":
+            blur.start = min(end - minimum, max(0.0, start + (time - origin)))
+            blur.end = end
+        elif mode == "blur-right":
+            blur.end = max(start + minimum, min(limit, end + (time - origin)))
+            blur.start = start
+        else:
+            duration = max(minimum, end - start)
+            moved = start + (time - origin)
+            moved = max(0.0, min(max(0.0, limit - duration), moved))
+            blur.start = moved
+            blur.end = moved + duration
+        self.update()
+        self.blurEdited.emit()
+
     def _hit_clip(self, pos) -> tuple[int, str]:
         for index in range(len(self.clips)):
             rect = self._clip_rect(index)
@@ -229,6 +295,27 @@ class TimelineCanvas(QWidget):
             return
         pos = event.position().toPoint()
         time = self._x_to_time(int(event.position().x()))
+        blur_hit = self._hit_blur(pos)
+        if blur_hit:
+            blur, zone = blur_hit
+            self.selected_blur = blur.id
+            self.music_selected = False
+            self.blurSelected.emit(blur.id)
+            self._drag = {
+                "mode": f"blur-{zone}",
+                "id": blur.id,
+                "start": blur.start,
+                "end": blur.end,
+                "time": time,
+            }
+            self.setCursor(
+                Qt.CursorShape.SizeHorCursor if zone in {"left", "right"} else Qt.CursorShape.SizeAllCursor
+            )
+            self.update()
+            return
+        if self.selected_blur:
+            self.selected_blur = ""
+            self.blurSelected.emit("")
         index, zone = self._hit_clip(pos)
         if index >= 0:
             self.selected = index
@@ -263,6 +350,9 @@ class TimelineCanvas(QWidget):
         self.update()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._drag and str(self._drag.get("mode", "")).startswith("blur"):
+            self._apply_blur_drag(self._x_to_time(int(event.position().x())))
+            return
         if self._drag and self._drag.get("mode") == "playhead":
             time = self._x_to_time(int(event.position().x()))
             self.playhead = time
@@ -282,13 +372,24 @@ class TimelineCanvas(QWidget):
             self.clipsTrimmed.emit()
             self.update()
             return
-        index, zone = self._hit_clip(event.position().toPoint())
+        pos = event.position().toPoint()
+        blur_hit = self._hit_blur(pos)
+        if blur_hit:
+            zone = blur_hit[1]
+            self.setCursor(
+                Qt.CursorShape.SizeHorCursor if zone in {"left", "right"} else Qt.CursorShape.SizeAllCursor
+            )
+            return
+        index, zone = self._hit_clip(pos)
         self.setCursor(Qt.CursorShape.SizeHorCursor if zone in {"left", "right"} else Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         was_playhead = bool(self._drag and self._drag.get("mode") == "playhead")
+        was_blur = bool(self._drag and str(self._drag.get("mode", "")).startswith("blur"))
         self._drag = None
         self.setCursor(Qt.CursorShape.ArrowCursor)
+        if was_blur:
+            self.blurEdited.emit()
         if was_playhead:
             self.playheadReleased.emit(self.playhead)
 
@@ -299,6 +400,8 @@ class TimelineWidget(QScrollArea):
     playheadReleased = Signal(float)
     clipsTrimmed = Signal()
     musicSelected = Signal()
+    blurSelected = Signal(str)
+    blurEdited = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -315,6 +418,8 @@ class TimelineWidget(QScrollArea):
         self.canvas.playheadReleased.connect(self.playheadReleased)
         self.canvas.clipsTrimmed.connect(self.clipsTrimmed)
         self.canvas.musicSelected.connect(self.musicSelected)
+        self.canvas.blurSelected.connect(self.blurSelected)
+        self.canvas.blurEdited.connect(self.blurEdited)
 
     def set_state(self, *args, **kwargs) -> None:
         self.canvas.set_state(*args, **kwargs)

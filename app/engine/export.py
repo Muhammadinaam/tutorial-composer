@@ -5,7 +5,7 @@ from pathlib import Path
 
 from app.engine.edl import joined_duration, target_video_size
 from app.engine.ffmpeg import media_info, run
-from app.engine.project import Clip, Project
+from app.engine.project import BlurRegion, Clip, Project, clamp_speed
 from app.engine.timeline import Hold, TimelinePlan
 
 
@@ -236,6 +236,175 @@ def apply_holds(source: Path, holds: list[Hold], dest: Path, on_progress=None) -
     return dest
 
 
+def blur_pixels(blur: BlurRegion, width: int, height: int) -> tuple[int, int, int, int] | None:
+    if width < 16 or height < 16:
+        return None
+    x = int(round(float(blur.x) * width))
+    y = int(round(float(blur.y) * height))
+    w = int(round(float(blur.w) * width))
+    h = int(round(float(blur.h) * height))
+    if x % 2:
+        x -= 1
+    if y % 2:
+        y -= 1
+    x = max(0, x)
+    y = max(0, y)
+    if w % 2:
+        w -= 1
+    if h % 2:
+        h -= 1
+    w = max(8, w)
+    h = max(8, h)
+    if x + w > width:
+        w = width - x
+        if w % 2:
+            w -= 1
+    if y + h > height:
+        h = height - y
+        if h % 2:
+            h -= 1
+    if w < 8 or h < 8:
+        return None
+    return x, y, w, h
+
+
+def blur_filter_script(blurs: list[BlurRegion], width: int, height: int, duration: float) -> str:
+    filters: list[str] = []
+    current = "0:v"
+    placed = 0
+    for blur in blurs:
+        if blur.end - blur.start < 0.05 or blur.w <= 0.01 or blur.h <= 0.01:
+            continue
+        pixels = blur_pixels(blur, width, height)
+        if not pixels:
+            continue
+        x, y, w, h = pixels
+        luma = max(1, min(20, w // 2 - 1, h // 2 - 1))
+        # Chroma is subsampled, so its radius has to stay within about a quarter of the crop.
+        chroma = max(1, min(luma, w // 4 - 1, h // 4 - 1))
+        start = max(0.0, min(duration, float(blur.start)))
+        end = max(start + 0.04, min(duration, float(blur.end)))
+        filters.append(f"[{current}]split=2[base{placed}][src{placed}]")
+        filters.append(
+            f"[src{placed}]crop={w}:{h}:{x}:{y},boxblur={luma}:1:{chroma}:1[blur{placed}]"
+        )
+        filters.append(
+            f"[base{placed}][blur{placed}]overlay={x}:{y}:enable='between(t\\,{start:.3f}\\,{end:.3f})'[v{placed}]"
+        )
+        current = f"v{placed}"
+        placed += 1
+    if not filters:
+        return ""
+    filters[-1] = filters[-1].rsplit("[", 1)[0] + "[vout]"
+    return ";\n".join(filters)
+
+
+def atempo_chain(rate: float) -> str:
+    factors: list[float] = []
+    remaining = float(rate)
+    while remaining < 0.5 - 1e-6:
+        factors.append(0.5)
+        remaining /= 0.5
+    while remaining > 2.0 + 1e-6:
+        factors.append(2.0)
+        remaining /= 2.0
+    factors.append(remaining)
+    return ",".join(f"atempo={factor:.5f}" for factor in factors)
+
+
+def apply_blurs(source: Path, blurs: list[BlurRegion], dest: Path, on_progress=None) -> Path:
+    info = media_info(source)
+    width = int(info["width"] or 0)
+    height = int(info["height"] or 0)
+    duration = max(float(info["duration"] or 0.0), 0.1)
+    script_body = blur_filter_script(blurs, width, height, duration)
+    if not script_body:
+        if source.resolve() != dest.resolve():
+            shutil.copy2(source, dest)
+        if on_progress:
+            on_progress(1.0)
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    script = dest.with_suffix(".blur.ffscript")
+    script.write_text(script_body, encoding="utf-8")
+    cmd = [
+        "-i",
+        str(source),
+        "-filter_complex_script",
+        str(script),
+        "-map",
+        "[vout]",
+    ]
+    if info["has_audio"]:
+        cmd.extend(["-map", "0:a", "-c:a", "aac", "-b:a", "192k"])
+    else:
+        cmd.append("-an")
+    cmd.extend(
+        [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            str(dest),
+            "-y",
+        ]
+    )
+    run(cmd, on_progress=on_progress, duration=duration)
+    return dest
+
+
+def apply_speed(source: Path, dest: Path, rate: float, on_progress=None) -> Path:
+    rate = clamp_speed(rate)
+    if abs(rate - 1.0) < 0.005:
+        if source.resolve() != dest.resolve():
+            shutil.copy2(source, dest)
+        if on_progress:
+            on_progress(1.0)
+        return dest
+    info = media_info(source)
+    duration = max(float(info["duration"] or 0.0), 0.1)
+    out_duration = max(0.1, duration / rate)
+    filters = [f"[0:v]setpts=PTS/{rate:.5f}[vout]"]
+    if info["has_audio"]:
+        filters.append(f"[0:a]{atempo_chain(rate)}[aout]")
+    script = dest.with_suffix(".speed.ffscript")
+    script.write_text(";\n".join(filters), encoding="utf-8")
+    cmd = [
+        "-i",
+        str(source),
+        "-filter_complex_script",
+        str(script),
+        "-map",
+        "[vout]",
+    ]
+    if info["has_audio"]:
+        cmd.extend(["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"])
+    else:
+        cmd.append("-an")
+    cmd.extend(
+        [
+            "-t",
+            f"{out_duration:.3f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            str(dest),
+            "-y",
+        ]
+    )
+    run(cmd, on_progress=on_progress, duration=out_duration)
+    return dest
+
+
 def mix_tts(
     video: Path,
     tts_items: list[tuple[float, Path]],
@@ -362,30 +531,52 @@ def export_project(
         project.clips,
         joined,
         mute=project.mute_original,
-        on_progress=hook("Joining clips", 0.0, 0.34),
+        on_progress=hook("Joining clips", 0.0, 0.28),
     )
-    emit("Inserting freeze frames…", percent_start + span * 0.34)
+    picture = joined
+    blurs = list(getattr(project, "blurs", []) or [])
+    if blurs:
+        emit("Blurring regions…", percent_start + span * 0.28)
+        picture = work / "blurred.mp4"
+        apply_blurs(
+            joined,
+            blurs,
+            picture,
+            on_progress=hook("Blurring regions", 0.28, 0.44),
+        )
+    emit("Inserting freeze frames…", percent_start + span * 0.44)
     held = work / "held.mp4"
     apply_holds(
-        joined,
+        picture,
         plan.holds,
         held,
-        on_progress=hook("Inserting freeze frames", 0.34, 0.58),
+        on_progress=hook("Inserting freeze frames", 0.44, 0.62),
     )
     items = [
         (cue.output_time, path)
         for cue, path in zip(plan.cues, tts_paths)
         if path and Path(path).is_file()
     ]
-    emit("Encoding final MP4…", percent_start + span * 0.58)
+    rate = clamp_speed(getattr(project, "speed", 1.0))
+    mix_dest = work / "mixed.mp4" if abs(rate - 1.0) >= 0.005 else dest
+    emit("Encoding final MP4…", percent_start + span * 0.62)
+    mix_end = 0.86 if mix_dest != dest else 1.0
     mix_tts(
         held,
         items,
-        dest,
+        mix_dest,
         keep_original_audio=not project.mute_original,
         music_path=project.music_path,
         music_volume=project.music_volume,
         voice_volume=getattr(project, "voice_volume", 1.0),
-        on_progress=hook("Encoding final MP4", 0.58, 1.0),
+        on_progress=hook("Encoding final MP4", 0.62, mix_end),
     )
+    if mix_dest != dest:
+        emit("Applying speed…", percent_start + span * mix_end)
+        apply_speed(
+            mix_dest,
+            dest,
+            rate,
+            on_progress=hook("Applying speed", mix_end, 1.0),
+        )
     return dest

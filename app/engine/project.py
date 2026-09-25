@@ -54,6 +54,52 @@ class Cue:
         )
 
 
+def clamp_speed(value: float) -> float:
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        rate = 1.0
+    if rate != rate:  # NaN
+        rate = 1.0
+    return max(0.25, min(2.0, rate))
+
+
+@dataclass
+class BlurRegion:
+    start: float
+    end: float
+    x: float
+    y: float
+    w: float
+    h: float
+    id: str = field(default_factory=new_id)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> BlurRegion:
+        region = cls(
+            start=float(data.get("start", 0.0)),
+            end=float(data.get("end", 0.0)),
+            x=float(data.get("x", 0.0)),
+            y=float(data.get("y", 0.0)),
+            w=float(data.get("w", 0.2)),
+            h=float(data.get("h", 0.2)),
+            id=str(data.get("id") or new_id()),
+        )
+        region.clamp()
+        return region
+
+    def clamp(self) -> None:
+        self.w = max(0.02, min(1.0, float(self.w)))
+        self.h = max(0.02, min(1.0, float(self.h)))
+        self.x = max(0.0, min(1.0 - self.w, float(self.x)))
+        self.y = max(0.0, min(1.0 - self.h, float(self.y)))
+        self.start = max(0.0, float(self.start))
+        self.end = max(self.start + 0.08, float(self.end))
+
+
 @dataclass
 class Narration:
     lang: str = "en"
@@ -92,6 +138,8 @@ class Project:
     music_duration: float = 0.0
     mark_in: float | None = None
     mark_out: float | None = None
+    blurs: list[BlurRegion] = field(default_factory=list)
+    speed: float = 1.0
     path: str | None = None
 
     def __post_init__(self) -> None:
@@ -129,6 +177,8 @@ class Project:
             "music_duration": self.music_duration,
             "mark_in": self.mark_in,
             "mark_out": self.mark_out,
+            "blurs": [blur.to_dict() for blur in self.blurs],
+            "speed": clamp_speed(self.speed),
         }
 
     @classmethod
@@ -156,6 +206,10 @@ class Project:
             narrations[lang] = Narration(lang=lang, voice=voice, cues=cues)
         elif lang in narrations and not narrations[lang].cues and cues:
             narrations[lang].cues = list(cues)
+        blurs = []
+        for raw in data.get("blurs") or []:
+            if isinstance(raw, dict):
+                blurs.append(BlurRegion.from_dict(raw))
         return cls(
             clips=clips,
             mute_original=bool(data.get("mute_original", True)),
@@ -170,6 +224,8 @@ class Project:
             music_duration=float(data.get("music_duration", 0.0)),
             mark_in=data.get("mark_in"),
             mark_out=data.get("mark_out"),
+            blurs=blurs,
+            speed=clamp_speed(data.get("speed", 1.0)),
             path=path,
         )
 
