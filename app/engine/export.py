@@ -51,7 +51,7 @@ def concat_clips(clips: list[Clip], dest: Path, mute: bool = True, on_progress=N
         duration = max(0.04, end - start)
         scale = (
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps:.3f},format=yuv420p"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps:.3f},setsar=1,format=yuv420p"
         )
         if clip.is_image:
             filters.append(
@@ -105,7 +105,9 @@ def concat_clips(clips: list[Clip], dest: Path, mute: bool = True, on_progress=N
             duration=duration,
         )
     else:
-        filters.append(f"{''.join(concat_v)}{''.join(concat_a)}concat=n={n}:v=1:a=1[vout][aout]")
+        # concat needs interleaved [v0][a0][v1][a1]… — not all videos then all audios
+        interleaved = "".join(f"{v}{a}" for v, a in zip(concat_v, concat_a))
+        filters.append(f"{interleaved}concat=n={n}:v=1:a=1[vout][aout]")
         filter_graph = ";".join(filters)
         run(
             [
@@ -203,13 +205,11 @@ def apply_holds(source: Path, holds: list[Hold], dest: Path, on_progress=None) -
         )
     else:
         filters.append(f"{''.join(vlabels)}concat=n={len(vlabels)}:v=1:a=0[vout]")
-    script = dest.with_suffix(".hold.ffscript")
-    script.write_text(";\n".join(filters), encoding="utf-8")
     cmd = [
         "-i",
         str(source),
-        "-filter_complex_script",
-        str(script),
+        "-filter_complex",
+        ";".join(filters),
         "-map",
         "[vout]",
     ]
@@ -325,13 +325,11 @@ def apply_blurs(source: Path, blurs: list[BlurRegion], dest: Path, on_progress=N
             on_progress(1.0)
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
-    script = dest.with_suffix(".blur.ffscript")
-    script.write_text(script_body, encoding="utf-8")
     cmd = [
         "-i",
         str(source),
-        "-filter_complex_script",
-        str(script),
+        "-filter_complex",
+        script_body.replace("\n", ""),
         "-map",
         "[vout]",
     ]
@@ -371,13 +369,11 @@ def apply_speed(source: Path, dest: Path, rate: float, on_progress=None) -> Path
     filters = [f"[0:v]setpts=PTS/{rate:.5f}[vout]"]
     if info["has_audio"]:
         filters.append(f"[0:a]{atempo_chain(rate)}[aout]")
-    script = dest.with_suffix(".speed.ffscript")
-    script.write_text(";\n".join(filters), encoding="utf-8")
     cmd = [
         "-i",
         str(source),
-        "-filter_complex_script",
-        str(script),
+        "-filter_complex",
+        ";".join(filters),
         "-map",
         "[vout]",
     ]
@@ -471,13 +467,11 @@ def mix_tts(
             f"dropout_transition=0:normalize=0[aout]"
         )
 
-    script = dest.with_suffix(".mix.ffscript")
-    script.write_text(";\n".join(filters), encoding="utf-8")
     run(
         [
             *inputs,
-            "-filter_complex_script",
-            str(script),
+            "-filter_complex",
+            ";".join(filters),
             "-map",
             "0:v",
             "-map",

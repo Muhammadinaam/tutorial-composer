@@ -43,6 +43,10 @@ from app.engine.edl import (
     clip_joined_start,
     delete_joined_range,
     joined_duration,
+    remap_blurs_for_reorder,
+    remap_cues_for_reorder,
+    remap_joined_time,
+    reorder_clip,
     ripple_blurs,
     ripple_cues,
     map_joined_to_clip,
@@ -190,6 +194,7 @@ class MainWindow(QMainWindow):
         self._joining = False
         self._music_selected = False
         self._selected_blur_id = ""
+        self._selected_cue_index = -1
         self.tts_store: dict[str, tuple] = {}
         self._loading_table = False
         self._switching_lang = False
@@ -458,7 +463,9 @@ class MainWindow(QMainWindow):
         tools = QHBoxLayout()
         tools.setSpacing(4)
         self.add_video_btn = QPushButton("Add video")
+        self.add_video_btn.setToolTip("Add video files to the end of V1. Drag clips on the timeline to rearrange.")
         self.add_image_btn = QPushButton("Add image")
+        self.add_image_btn.setToolTip("Add images to the end of V1. Drag clips on the timeline to rearrange.")
         self.add_music_btn = QPushButton("Add music")
         self.remove_music_btn = QPushButton("Remove music")
         self.split_btn = QPushButton("Split")
@@ -529,6 +536,7 @@ class MainWindow(QMainWindow):
         tl_box.addLayout(mix_row)
         self.timeline = TimelineWidget()
         self.timeline.setToolTip(
+            "Drag clips on V1 to rearrange. Drag voice blocks on VO to change when they play. "
             "Mark In / Mark Out / Delete In→Out to cut the middle. "
             "Blur, then drag on the preview. Drag a purple bar to change when the blur shows. "
             "Or Split twice and Delete clip. Drag the red line to scrub."
@@ -616,6 +624,9 @@ class MainWindow(QMainWindow):
         self.timeline.playheadMoved.connect(self._timeline_seek)
         self.timeline.playheadReleased.connect(self._timeline_seek_done)
         self.timeline.clipsTrimmed.connect(self._after_trim)
+        self.timeline.clipsReordered.connect(self._after_reorder)
+        self.timeline.cueSelected.connect(self._timeline_cue_selected)
+        self.timeline.cueMoved.connect(self._after_cue_moved)
         self._warn_timer = QTimer(self)
         self._warn_timer.setSingleShot(True)
         self._warn_timer.setInterval(400)
@@ -1000,12 +1011,23 @@ class MainWindow(QMainWindow):
             mark_out=self.project.mark_out,
             blurs=self.project.blurs,
             selected_blur=self._selected_blur_id,
+            selected_cue=self._selected_cue_index,
         )
         blur = self._selected_blur()
         if blur:
             self.selected_label.setText(
                 f"Blur {format_timestamp(blur.start)}–{format_timestamp(blur.end)}"
             )
+        elif self._selected_cue_index >= 0:
+            cues = self._spoken_cues()
+            if 0 <= self._selected_cue_index < len(cues):
+                cue = cues[self._selected_cue_index]
+                preview = (cue.text[:48] + "…") if len(cue.text) > 48 else cue.text
+                self.selected_label.setText(
+                    f"Voice @ {format_timestamp(cue.video_time)}: {preview or '(empty)'}"
+                )
+            else:
+                self.selected_label.setText("No voice selected")
         elif self._music_selected and self.project.music_path:
             self.selected_label.setText(f"Music: {Path(self.project.music_path).name}")
         else:
@@ -1058,15 +1080,82 @@ class MainWindow(QMainWindow):
     def _timeline_clip_selected(self, index: int) -> None:
         self._music_selected = False
         self._selected_blur_id = ""
+        self._selected_cue_index = -1
         self.selected_index = index
         clip = self.current_clip()
         if clip:
             kind = "Image" if clip.is_image else "Video"
             self.selected_label.setText(f"{kind}: {clip.name}")
 
+    def _timeline_cue_selected(self, index: int) -> None:
+        self._music_selected = False
+        self._selected_blur_id = ""
+        self._selected_cue_index = index
+        cues = self._spoken_cues()
+        if 0 <= index < len(cues):
+            self.cue_table.setCurrentCell(index, 1)
+            self.playhead = cues[index].video_time
+            self._refresh_transport()
+        self.refresh_timeline()
+
+    def _after_cue_moved(self, index: int, new_time: float) -> None:
+        cues = list(self._spoken_cues())
+        if index < 0 or index >= len(cues):
+            return
+        new_time = max(0.0, float(new_time))
+        if abs(cues[index].video_time - new_time) < 0.001:
+            return
+        moved = Cue(
+            video_time=new_time,
+            text=cues[index].text,
+            should_video_stop=cues[index].should_video_stop,
+        )
+        paths = list(self.tts_paths) if len(self.tts_paths) == len(cues) else [None] * len(cues)
+        durations = (
+            list(self.tts_durations) if len(self.tts_durations) == len(cues) else [None] * len(cues)
+        )
+        items = list(zip(cues, paths, durations))
+        items[index] = (moved, paths[index], durations[index])
+        items.sort(key=lambda item: item[0].video_time)
+        new_cues = [item[0] for item in items]
+        new_paths = [item[1] for item in items]
+        new_durations = [item[2] for item in items]
+        self.project.current().cues = new_cues
+        self.project.cues = new_cues
+        self.project.sync_from_current()
+        if all(path is not None for path in new_paths) and all(
+            duration is not None for duration in new_durations
+        ):
+            self.tts_paths = list(new_paths)
+            self.tts_durations = [float(d) for d in new_durations]
+            self.plan = build_timeline(
+                new_cues, self.tts_durations, joined_duration(self.project.clips)
+            )
+            self._save_tts()
+        else:
+            self._rebuild_plan_from_tts()
+        self._selected_cue_index = next(
+            (
+                i
+                for i, cue in enumerate(new_cues)
+                if abs(cue.video_time - moved.video_time) < 0.001 and cue.text == moved.text
+            ),
+            index,
+        )
+        self._load_cues_into_table()
+        if 0 <= self._selected_cue_index < self.cue_table.rowCount():
+            self.cue_table.setCurrentCell(self._selected_cue_index, 1)
+        self.playhead = moved.video_time
+        self.refresh_warnings()
+        self._refresh_transport()
+        self.refresh_timeline()
+        self._show_current_media(force=True)
+        self._set_status(f"Moved voice to {format_timestamp(moved.video_time)}.")
+
     def _music_track_selected(self) -> None:
         self._music_selected = True
         self._selected_blur_id = ""
+        self._selected_cue_index = -1
         self.selected_index = -1
         if self.project.music_path:
             self.selected_label.setText(f"Music: {Path(self.project.music_path).name}")
@@ -1092,6 +1181,42 @@ class MainWindow(QMainWindow):
         self.refresh_warnings()
         self._refresh_transport()
         self.refresh_timeline()
+
+    def _after_reorder(self, from_index: int, to_index: int) -> None:
+        if from_index == to_index:
+            return
+        if from_index < 0 or from_index >= len(self.project.clips):
+            return
+        if to_index < 0 or to_index >= len(self.project.clips):
+            return
+        old_clips = list(self.project.clips)
+        new_clips = reorder_clip(old_clips, from_index, to_index)
+        if new_clips is old_clips:
+            return
+        self.project.clips = new_clips
+        self.project.blurs = remap_blurs_for_reorder(self.project.blurs, old_clips, new_clips)
+        for narration in self.project.narrations.values():
+            narration.cues = remap_cues_for_reorder(narration.cues, old_clips, new_clips)
+        self.project.sync_from_current()
+        self.playhead = remap_joined_time(old_clips, new_clips, self.playhead)
+        if self.project.mark_in is not None:
+            self.project.mark_in = remap_joined_time(old_clips, new_clips, self.project.mark_in)
+        if self.project.mark_out is not None:
+            self.project.mark_out = remap_joined_time(old_clips, new_clips, self.project.mark_out)
+        self.selected_index = to_index
+        self._load_cues_into_table()
+        spoken = self._spoken_cues()
+        if self.plan and len(self.tts_durations) == len(spoken) == len(self.plan.cues):
+            self.plan = build_timeline(spoken, self.tts_durations, joined_duration(self.project.clips))
+            self._save_tts()
+        self.refresh_warnings()
+        self._refresh_transport()
+        self.refresh_timeline()
+        self._show_current_media(force=True)
+        clip = self.project.clips[to_index]
+        kind = "Image" if clip.is_image else "Video"
+        self.selected_label.setText(f"{kind}: {clip.name}")
+        self._set_status(f"Moved {clip.name} on V1.")
 
     def _seek_joined(self, seconds: float, keep_playing: bool = False, live: bool = False) -> None:
         total = joined_duration(self.project.clips)
@@ -2172,6 +2297,8 @@ class MainWindow(QMainWindow):
             region.start = max(0.0, region.end - 0.08)
         self.project.blurs.append(region)
         self._selected_blur_id = region.id
+        self._selected_cue_index = -1
+        self._music_selected = False
         if self.playhead < region.start - 0.001 or self.playhead > region.end + 0.001:
             self._seek_joined(region.start)
         else:
@@ -2186,6 +2313,7 @@ class MainWindow(QMainWindow):
         self._selected_blur_id = blur_id or ""
         if blur_id:
             self._music_selected = False
+            self._selected_cue_index = -1
         self.refresh_timeline()
         self._sync_preview_overlays()
 
@@ -2591,6 +2719,7 @@ class MainWindow(QMainWindow):
         self.selected_index = -1
         self._music_selected = False
         self._selected_blur_id = ""
+        self._selected_cue_index = -1
         self.blur_btn.setChecked(False)
         self._pause_all()
         self.player.stop()
@@ -2616,6 +2745,7 @@ class MainWindow(QMainWindow):
         self.selected_index = 0 if self.project.clips else -1
         self._music_selected = False
         self._selected_blur_id = ""
+        self._selected_cue_index = -1
         self.blur_btn.setChecked(False)
         self.refresh_all()
         self._set_status(f"Opened {Path(path).name}")

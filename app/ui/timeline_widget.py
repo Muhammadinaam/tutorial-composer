@@ -14,6 +14,9 @@ class TimelineCanvas(QWidget):
     playheadMoved = Signal(float)
     playheadReleased = Signal(float)
     clipsTrimmed = Signal()
+    clipsReordered = Signal(int, int)
+    cueSelected = Signal(int)
+    cueMoved = Signal(int, float)
     musicSelected = Signal()
     blurSelected = Signal(str)
     blurEdited = Signal()
@@ -24,6 +27,7 @@ class TimelineCanvas(QWidget):
         self.clips: list[Clip] = []
         self.cue_spans: list[tuple] = []
         self.selected = -1
+        self.selected_cue = -1
         self.music_selected = False
         self.playhead = 0.0
         self.pps = 80.0
@@ -39,6 +43,9 @@ class TimelineCanvas(QWidget):
         self.track_h = 34
         self.track_gap = 4
         self._drag = None
+        self._reorder_insert = -1
+        self._reorder_threshold = 8
+        self._cue_drag_threshold = 6
 
     def set_state(
         self,
@@ -54,11 +61,12 @@ class TimelineCanvas(QWidget):
         mark_out: float | None = None,
         blurs: list[BlurRegion] | None = None,
         selected_blur: str = "",
+        selected_cue: int = -1,
     ) -> None:
         self.clips = clips
         self.selected = selected
         self.playhead = max(0.0, playhead)
-        self.cue_spans = cue_spans or []
+        self.cue_spans = list(cue_spans or [])
         self.music_name = music_name
         self.music_duration = music_duration
         self.music_selected = music_selected
@@ -67,6 +75,7 @@ class TimelineCanvas(QWidget):
         self.mark_out = mark_out
         self.blurs = list(blurs or [])
         self.selected_blur = selected_blur or ""
+        self.selected_cue = selected_cue
         self._refresh_size()
         self.update()
 
@@ -111,6 +120,25 @@ class TimelineCanvas(QWidget):
         track = self._track_rect(0)
         return QRect(self._time_to_x(start), track.y(), width, track.height())
 
+    def _cue_rect(self, index: int) -> QRect:
+        start, length, *_rest = self.cue_spans[index]
+        track = self._track_rect(1)
+        return QRect(
+            self._time_to_x(float(start)),
+            track.y(),
+            max(10, int(float(length) * self.pps)),
+            track.height(),
+        )
+
+    def _set_cue_start(self, index: int, start: float) -> None:
+        if index < 0 or index >= len(self.cue_spans):
+            return
+        span = self.cue_spans[index]
+        length = float(span[1])
+        text = span[2]
+        ready = span[3] if len(span) > 3 else True
+        self.cue_spans[index] = (max(0.0, start), length, text, ready)
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -150,11 +178,29 @@ class TimelineCanvas(QWidget):
         for index, clip in enumerate(self.clips):
             rect = self._clip_rect(index)
             selected = index == self.selected and not self.music_selected and not self.selected_blur
+            dragging = bool(
+                self._drag
+                and self._drag.get("mode") == "reorder"
+                and self._drag.get("index") == index
+            )
             if clip.is_image:
                 fill = QColor("#c4922a") if selected else QColor("#8a6a2d")
             else:
                 fill = QColor("#3d8fd1") if selected else QColor("#2c5f8a")
+            if dragging:
+                fill = QColor(fill.red(), fill.green(), fill.blue(), 120)
             self._draw_block(painter, rect, fill, selected, f"{'IMG' if clip.is_image else 'VID'}  {clip.name}", format_timestamp(clip.used))
+
+        if self._drag and self._drag.get("mode") == "reorder" and self._reorder_insert >= 0:
+            track = self._track_rect(0)
+            x = self._insert_marker_x(self._reorder_insert)
+            painter.setPen(QPen(QColor("#f4d35e"), 3))
+            painter.drawLine(x, track.y() - 2, x, track.bottom() + 2)
+            painter.setBrush(QColor("#f4d35e"))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPolygon(
+                [QPoint(x - 5, track.y() - 2), QPoint(x + 5, track.y() - 2), QPoint(x, track.y() + 6)]
+            )
 
         for blur in self.blurs:
             rect = self._blur_bar_rect(blur)
@@ -172,17 +218,25 @@ class TimelineCanvas(QWidget):
             painter.setPen(QColor("#6b7078"))
             painter.setFont(QFont("Segoe UI", 8))
             painter.drawText(vo.adjusted(10, 0, 0, 0), Qt.AlignmentFlag.AlignVCenter, "Narration cues appear here")
-        for span in self.cue_spans:
+        for index, span in enumerate(self.cue_spans):
             start, length, text, *rest = span
             ready = rest[0] if rest else True
-            rect = QRect(self._time_to_x(start), vo.y(), max(10, int(length * self.pps)), vo.height())
+            rect = self._cue_rect(index)
+            selected = index == self.selected_cue
+            dragging = bool(
+                self._drag
+                and self._drag.get("mode") == "cue-move"
+                and self._drag.get("index") == index
+            )
             if ready:
-                fill = QColor("#2e7d5b")
+                fill = QColor("#3aa87a") if selected else QColor("#2e7d5b")
                 subtitle = format_timestamp(length)
             else:
-                fill = QColor("#8a6a2d")
+                fill = QColor("#c4922a") if selected else QColor("#8a6a2d")
                 subtitle = "No voice — Generate"
-            self._draw_block(painter, rect, fill, not ready, text, subtitle)
+            if dragging:
+                fill = QColor(fill.red(), fill.green(), fill.blue(), 140)
+            self._draw_block(painter, rect, fill, selected, text, subtitle)
 
         music = self._track_rect(2)
         if self.music_name:
@@ -287,8 +341,36 @@ class TimelineCanvas(QWidget):
             return index, "body"
         return -1, ""
 
+    def _hit_cue(self, pos) -> int:
+        for index in range(len(self.cue_spans) - 1, -1, -1):
+            if self._cue_rect(index).contains(pos):
+                return index
+        return -1
+
     def _hit_music(self, pos) -> bool:
         return self.music_name != "" and self._track_rect(2).contains(pos)
+
+    def _insert_index_at(self, x: int) -> int:
+        """Return the destination index for a drop at x (final index after move)."""
+        if not self.clips:
+            return 0
+        time = self._x_to_time(x)
+        for index, clip in enumerate(self.clips):
+            start = clip_joined_start(self.clips, index)
+            mid = start + clip.used / 2.0
+            if time < mid:
+                return index
+        return len(self.clips) - 1
+
+    def _insert_marker_x(self, insert_index: int) -> int:
+        """X position of the yellow drop marker for a destination index."""
+        from_index = int(self._drag.get("index", -1)) if self._drag else -1
+        if insert_index <= 0:
+            return self._time_to_x(0.0)
+        if from_index >= 0 and insert_index > from_index:
+            end = clip_joined_start(self.clips, insert_index) + self.clips[insert_index].used
+            return self._time_to_x(end)
+        return self._time_to_x(clip_joined_start(self.clips, insert_index))
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
@@ -300,6 +382,7 @@ class TimelineCanvas(QWidget):
             blur, zone = blur_hit
             self.selected_blur = blur.id
             self.music_selected = False
+            self.selected_cue = -1
             self.blurSelected.emit(blur.id)
             self._drag = {
                 "mode": f"blur-{zone}",
@@ -316,9 +399,27 @@ class TimelineCanvas(QWidget):
         if self.selected_blur:
             self.selected_blur = ""
             self.blurSelected.emit("")
+        cue_index = self._hit_cue(pos)
+        if cue_index >= 0:
+            self.selected_cue = cue_index
+            self.music_selected = False
+            self.cueSelected.emit(cue_index)
+            span = self.cue_spans[cue_index]
+            self._drag = {
+                "mode": "cue-press",
+                "index": cue_index,
+                "x": pos.x(),
+                "time": time,
+                "start": float(span[0]),
+                "length": float(span[1]),
+            }
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.update()
+            return
         index, zone = self._hit_clip(pos)
         if index >= 0:
             self.selected = index
+            self.selected_cue = -1
             self.music_selected = False
             self.clipSelected.emit(index)
             clip = self.clips[index]
@@ -332,18 +433,26 @@ class TimelineCanvas(QWidget):
                 }
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
             else:
-                self._drag = {"mode": "playhead"}
                 self.playhead = time
                 self.playheadMoved.emit(self.playhead)
+                self._drag = {
+                    "mode": "clip-press",
+                    "index": index,
+                    "x": pos.x(),
+                    "time": time,
+                }
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
         elif self._hit_music(pos):
             self.music_selected = True
             self.selected = -1
+            self.selected_cue = -1
             self.musicSelected.emit()
             self._drag = {"mode": "playhead"}
             self.playhead = time
             self.playheadMoved.emit(self.playhead)
         else:
             self.music_selected = False
+            self.selected_cue = -1
             self._drag = {"mode": "playhead"}
             self.playhead = time
             self.playheadMoved.emit(self.playhead)
@@ -352,6 +461,33 @@ class TimelineCanvas(QWidget):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._drag and str(self._drag.get("mode", "")).startswith("blur"):
             self._apply_blur_drag(self._x_to_time(int(event.position().x())))
+            return
+        if self._drag and self._drag.get("mode") == "cue-press":
+            pos = event.position().toPoint()
+            if abs(pos.x() - int(self._drag["x"])) >= self._cue_drag_threshold:
+                self._drag["mode"] = "cue-move"
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            else:
+                return
+        if self._drag and self._drag.get("mode") == "cue-move":
+            time = self._x_to_time(int(event.position().x()))
+            delta = time - float(self._drag["time"])
+            new_start = max(0.0, float(self._drag["start"]) + delta)
+            self._set_cue_start(int(self._drag["index"]), new_start)
+            self._refresh_size()
+            self.update()
+            return
+        if self._drag and self._drag.get("mode") == "clip-press":
+            pos = event.position().toPoint()
+            if abs(pos.x() - int(self._drag["x"])) >= self._reorder_threshold:
+                self._drag = {"mode": "reorder", "index": int(self._drag["index"])}
+                self._reorder_insert = self._insert_index_at(pos.x())
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self.update()
+            return
+        if self._drag and self._drag.get("mode") == "reorder":
+            self._reorder_insert = self._insert_index_at(int(event.position().x()))
+            self.update()
             return
         if self._drag and self._drag.get("mode") == "playhead":
             time = self._x_to_time(int(event.position().x()))
@@ -380,18 +516,47 @@ class TimelineCanvas(QWidget):
                 Qt.CursorShape.SizeHorCursor if zone in {"left", "right"} else Qt.CursorShape.SizeAllCursor
             )
             return
+        if self._hit_cue(pos) >= 0:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            return
         index, zone = self._hit_clip(pos)
-        self.setCursor(Qt.CursorShape.SizeHorCursor if zone in {"left", "right"} else Qt.CursorShape.ArrowCursor)
+        if zone in {"left", "right"}:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif index >= 0:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        was_playhead = bool(self._drag and self._drag.get("mode") == "playhead")
-        was_blur = bool(self._drag and str(self._drag.get("mode", "")).startswith("blur"))
+        drag = self._drag
+        was_playhead = bool(drag and drag.get("mode") == "playhead")
+        was_blur = bool(drag and str(drag.get("mode", "")).startswith("blur"))
+        was_click = bool(drag and drag.get("mode") == "clip-press")
+        was_reorder = bool(drag and drag.get("mode") == "reorder")
+        was_cue_press = bool(drag and drag.get("mode") == "cue-press")
+        was_cue_move = bool(drag and drag.get("mode") == "cue-move")
+        from_index = int(drag.get("index", -1)) if drag else -1
+        to_index = self._reorder_insert if was_reorder else -1
+        cue_index = from_index if was_cue_move else -1
+        cue_time = float(self.cue_spans[cue_index][0]) if was_cue_move and 0 <= cue_index < len(self.cue_spans) else -1.0
         self._drag = None
+        self._reorder_insert = -1
         self.setCursor(Qt.CursorShape.ArrowCursor)
         if was_blur:
             self.blurEdited.emit()
-        if was_playhead:
+        if was_playhead or was_click:
             self.playheadReleased.emit(self.playhead)
+        if was_cue_press and from_index >= 0:
+            # Click without drag: jump playhead to cue start.
+            start = float(self.cue_spans[from_index][0]) if from_index < len(self.cue_spans) else 0.0
+            self.playhead = start
+            self.playheadMoved.emit(self.playhead)
+            self.playheadReleased.emit(self.playhead)
+        if was_reorder and from_index >= 0 and to_index >= 0 and from_index != to_index:
+            self.clipsReordered.emit(from_index, to_index)
+        if was_cue_move and cue_index >= 0:
+            self.cueMoved.emit(cue_index, cue_time)
+        self.update()
 
 
 class TimelineWidget(QScrollArea):
@@ -399,6 +564,9 @@ class TimelineWidget(QScrollArea):
     playheadMoved = Signal(float)
     playheadReleased = Signal(float)
     clipsTrimmed = Signal()
+    clipsReordered = Signal(int, int)
+    cueSelected = Signal(int)
+    cueMoved = Signal(int, float)
     musicSelected = Signal()
     blurSelected = Signal(str)
     blurEdited = Signal()
@@ -417,6 +585,9 @@ class TimelineWidget(QScrollArea):
         self.canvas.playheadMoved.connect(self.playheadMoved)
         self.canvas.playheadReleased.connect(self.playheadReleased)
         self.canvas.clipsTrimmed.connect(self.clipsTrimmed)
+        self.canvas.clipsReordered.connect(self.clipsReordered)
+        self.canvas.cueSelected.connect(self.cueSelected)
+        self.canvas.cueMoved.connect(self.cueMoved)
         self.canvas.musicSelected.connect(self.musicSelected)
         self.canvas.blurSelected.connect(self.blurSelected)
         self.canvas.blurEdited.connect(self.blurEdited)
