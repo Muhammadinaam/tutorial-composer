@@ -129,11 +129,18 @@ def guess_system_audio(audio_devices: list[str]) -> str | None:
     return None
 
 
-def new_recording_path() -> Path:
+def new_recording_path(directory: str | Path | None = None) -> Path:
     from datetime import datetime
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return recordings_dir() / f"recording_{stamp}.mp4"
+    folder = Path(directory) if directory else recordings_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    candidate = folder / f"recording_{stamp}.mp4"
+    index = 2
+    while candidate.exists():
+        candidate = folder / f"recording_{stamp}_{index}.mp4"
+        index += 1
+    return candidate
 
 
 def _gdigrab_input(region: CaptureRegion, fps: int) -> list[str]:

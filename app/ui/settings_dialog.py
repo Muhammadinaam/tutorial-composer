@@ -43,7 +43,8 @@ class SettingsDialog(QDialog):
 
         hint = QLabel(
             "Keys stay on this computer only. The app works without keys "
-            "using edge-tts. OpenAI is also used to auto-translate the script."
+            "using edge-tts. OpenAI is also used to auto-translate the script "
+            "and to write narration from the video."
         )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)

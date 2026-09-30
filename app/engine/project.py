@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+PROJECT_FILENAME = "project.json"
+MEDIA_DIRNAME = "media"
 
 
 def new_id() -> str:
@@ -230,16 +234,211 @@ class Project:
         )
 
 
+def media_dir_for(project_json: str | Path) -> Path:
+    return Path(project_json).parent / MEDIA_DIRNAME
+
+
+def is_project_bundle(path: str | Path | None) -> bool:
+    if not path:
+        return False
+    return Path(path).name.lower() == PROJECT_FILENAME
+
+
+def bundle_json_path(dest: str | Path) -> Path:
+    """Return the project.json path for a folder, a bundle file, or a legacy json file."""
+    dest = Path(dest)
+    if dest.exists() and dest.is_dir():
+        return dest / PROJECT_FILENAME
+    if dest.suffix.lower() == ".json":
+        if dest.name.lower() == PROJECT_FILENAME:
+            return dest
+        return dest.parent / dest.stem / PROJECT_FILENAME
+    return dest / PROJECT_FILENAME
+
+
+def _path_key(path: Path) -> str:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    return os.path.normcase(os.path.normpath(str(resolved)))
+
+
+def _is_under(path: Path, parent: Path) -> bool:
+    child = _path_key(path)
+    base = _path_key(parent)
+    if child == base:
+        return True
+    prefix = base if base.endswith(os.sep) else base + os.sep
+    return child.startswith(prefix)
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    return _path_key(left) == _path_key(right)
+
+
+def _dest_for(media: Path, source: Path) -> Path:
+    def usable(candidate: Path) -> bool:
+        return (not candidate.exists()) or _same_file(candidate, source)
+
+    candidate = media / source.name
+    if usable(candidate):
+        return candidate
+    stem = source.stem
+    suffix = source.suffix
+    number = 2
+    while True:
+        candidate = media / f"{stem}_{number}{suffix}"
+        if usable(candidate):
+            return candidate
+        number += 1
+
+
+def _store_media(
+    stored: str,
+    media: Path,
+    placed: dict[str, Path],
+    missing: list[str],
+    created: list[Path],
+) -> str:
+    source = Path(stored)
+    if not stored or not source.is_file():
+        missing.append(source.name or stored or "unknown")
+        return stored
+    key = _path_key(source)
+    existing = placed.get(key)
+    if existing is not None:
+        return str(existing)
+    if _is_under(source, media):
+        resolved = source.resolve()
+        placed[key] = resolved
+        return str(resolved)
+    dest = _dest_for(media, source)
+    if not dest.exists():
+        shutil.copy2(source, dest)
+        created.append(dest)
+    resolved = dest.resolve()
+    placed[key] = resolved
+    return str(resolved)
+
+
+def collect_media(project: Project, root: str | Path) -> list[str]:
+    """Copy clips and the soundtrack into ``root/media`` and point the project at those copies.
+
+    Files already in that media folder stay where they are. Missing files are left unchanged.
+    Returns the display names of missing files.
+    """
+    media = Path(root) / MEDIA_DIRNAME
+    media.mkdir(parents=True, exist_ok=True)
+    missing: list[str] = []
+    placed: dict[str, Path] = {}
+    created: list[Path] = []
+    clip_paths = [clip.path for clip in project.clips]
+    music_path = project.music_path
+    try:
+        for clip in project.clips:
+            clip.path = _store_media(clip.path, media, placed, missing, created)
+        if project.music_path:
+            project.music_path = _store_media(project.music_path, media, placed, missing, created)
+    except Exception:
+        for clip, old in zip(project.clips, clip_paths):
+            clip.path = old
+        project.music_path = music_path
+        for path in reversed(created):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
+    return missing
+
+
+def _resolve_stored_path(stored: str, root: Path) -> str:
+    path = Path(stored)
+    if path.is_absolute():
+        return str(path)
+    return str((root / path).resolve())
+
+
+def _relative_media_path(stored: str, root: Path) -> str:
+    path = Path(stored)
+    if not path.is_absolute():
+        return path.as_posix()
+    try:
+        resolved = path.resolve()
+        base = root.resolve()
+    except OSError:
+        return str(path)
+    if not _is_under(resolved, base):
+        return str(path)
+    return Path(os.path.relpath(resolved, base)).as_posix()
+
+
+def _purge_cached_recording(original: str | None, current: str | None) -> None:
+    if not original or not current:
+        return
+    source = Path(original)
+    if _same_file(source, Path(current)):
+        return
+    from app.engine.settings import recordings_dir
+
+    try:
+        cache = recordings_dir().resolve()
+    except OSError:
+        return
+    if not source.is_file() or not _is_under(source, cache):
+        return
+    try:
+        source.unlink()
+    except OSError:
+        pass
+
+
 def load_project(path: str | Path) -> Project:
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    return Project.from_dict(raw, path=str(path))
+    json_path = Path(path)
+    raw = json.loads(json_path.read_text(encoding="utf-8"))
+    project = Project.from_dict(raw, path=str(json_path))
+    root = json_path.parent
+    for clip in project.clips:
+        if clip.path:
+            clip.path = _resolve_stored_path(clip.path, root)
+    if project.music_path:
+        project.music_path = _resolve_stored_path(project.music_path, root)
+    return project
 
 
-def save_project(project: Project, path: str | Path | None = None) -> Path:
-    dest = Path(path or project.path or "")
-    if not dest:
+def save_project(project: Project, path: str | Path | None = None) -> tuple[Path, list[str]]:
+    """Write a project folder and return ``(project.json, missing file names)``.
+
+    ``path`` may be a project folder, ``project.json``, or a legacy standalone json file.
+    A legacy file is saved into a sibling folder named after that file. The old file is left in place.
+    In-memory clip and music paths stay absolute. The json stores paths relative to the folder.
+    Recordings copied out of the app cache are deleted after the json is written.
+    """
+    chosen = path if path is not None else project.path
+    if not chosen:
         raise ValueError("No path given to save the project.")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(json.dumps(project.to_dict(), indent=2), encoding="utf-8")
-    project.path = str(dest)
-    return dest
+    dest = Path(chosen)
+    json_path = bundle_json_path(dest)
+    root = json_path.parent
+    root.mkdir(parents=True, exist_ok=True)
+    originals = [clip.path for clip in project.clips]
+    music_original = project.music_path
+    missing = collect_media(project, root)
+    payload = project.to_dict()
+    for raw, clip in zip(payload["clips"], project.clips):
+        raw["path"] = _relative_media_path(clip.path, root)
+    if payload.get("music_path"):
+        payload["music_path"] = _relative_media_path(str(payload["music_path"]), root)
+    try:
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        for clip, old in zip(project.clips, originals):
+            clip.path = old
+        project.music_path = music_original
+        raise
+    project.path = str(json_path.resolve())
+    for original, clip in zip(originals, project.clips):
+        _purge_cached_recording(original, clip.path)
+    _purge_cached_recording(music_original, project.music_path)
+    return json_path.resolve(), missing

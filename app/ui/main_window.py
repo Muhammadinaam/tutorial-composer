@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.engine.capture import CaptureRegion, CaptureRequest, ScreenRecorder, even, new_recording_path
+from app.engine.describe import describe_timeline
 from app.engine.edl import (
     clip_joined_start,
     delete_joined_range,
@@ -48,7 +49,18 @@ from app.engine.edl import (
 )
 from app.engine.export import export_project
 from app.engine.ffmpeg import ffmpeg_available
-from app.engine.project import BlurRegion, Cue, Narration, Project, clamp_speed, load_project, save_project
+from app.engine.project import (
+    PROJECT_FILENAME,
+    BlurRegion,
+    Cue,
+    Narration,
+    Project,
+    clamp_speed,
+    is_project_bundle,
+    load_project,
+    media_dir_for,
+    save_project,
+)
 from app.engine.script import (
     estimate_speech_seconds,
     format_timestamp,
@@ -356,8 +368,13 @@ class MainWindow(QMainWindow):
         script_btns.setSpacing(4)
         self.generate_btn = QPushButton("Generate voices")
         self.generate_btn.setObjectName("accentButton")
+        self.describe_btn = QPushButton("Describe video")
+        self.describe_btn.setToolTip(
+            "Write narration for this language from the picture, using the OpenAI key"
+        )
         self.translate_btn = QPushButton("Translate")
         script_btns.addWidget(self.generate_btn)
+        script_btns.addWidget(self.describe_btn)
         script_btns.addWidget(self.translate_btn)
         script_box.addLayout(script_btns)
         side_box.addWidget(script_panel, 1)
@@ -524,6 +541,7 @@ class MainWindow(QMainWindow):
         self.voice_combo.currentIndexChanged.connect(self._voice_changed)
         self.preview_voice_btn.clicked.connect(self.preview_voice)
         self.generate_btn.clicked.connect(self.generate_voices)
+        self.describe_btn.clicked.connect(self.describe_video)
         self.translate_btn.clicked.connect(self.translate_script)
         self.export_btn.clicked.connect(self.export_video)
         self.timeline.clipSelected.connect(self._timeline_clip_selected)
@@ -659,6 +677,7 @@ class MainWindow(QMainWindow):
         self._hide_export_progress()
         self.generate_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
+        self.describe_btn.setEnabled(True)
         self.translate_btn.setEnabled(True)
         self.preview_voice_btn.setEnabled(True)
 
@@ -2320,6 +2339,56 @@ class MainWindow(QMainWindow):
             f"{LANGUAGE_NAMES.get(self.project.lang, self.project.lang)}.{extra}"
         )
 
+    def describe_video(self) -> None:
+        if not self.project.clips:
+            QMessageBox.information(self, "Describe video", "Add a video first.")
+            return
+        key = self.settings().get("openai_api_key", "")
+        if not key:
+            QMessageBox.information(
+                self,
+                "Describe video",
+                "Add an OpenAI API key in Settings to write narration from the video.",
+            )
+            return
+        self.project.current().cues = self._cues_from_table()
+        existing = [cue for cue in self.project.current().cues if cue.text.strip()]
+        if existing:
+            answer = QMessageBox.question(
+                self,
+                "Describe video",
+                "Replace the narration on this tab?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        if self._busy():
+            self.statusBar().showMessage("Please wait for the current task to finish.")
+            return
+        lang = self.project.lang
+        clips = list(self.project.clips)
+
+        def work(progress):
+            return describe_timeline(clips, lang, key, on_progress=progress)
+
+        self.describe_btn.setEnabled(False)
+        self._start_worker(work, self._described, progress_bar=True)
+
+    def _described(self, cues) -> None:
+        self.describe_btn.setEnabled(True)
+        self.project.current().cues = list(cues)
+        self.project.sync_from_current()
+        self._clear_tts(self.project.lang)
+        self._load_cues_into_table()
+        self.refresh_warnings()
+        self.refresh_timeline()
+        self._sync_narration()
+        language = LANGUAGE_NAMES.get(self.project.lang, self.project.lang)
+        self._set_status(
+            f"Wrote {len(cues)} line(s) in {language} from the video. "
+            "Click Generate voices to speak them."
+        )
+
     def translate_script(self) -> None:
         self.project.current().cues = self._cues_from_table()
         cues = [c for c in self._parsed_cues() if c.text.strip()]
@@ -2480,20 +2549,74 @@ class MainWindow(QMainWindow):
         self._set_status(f"Opened {Path(path).name}")
 
     def save_project_dialog(self) -> None:
-        if self.project.path:
-            save_project(self.project)
-            self._set_status("Project saved.")
+        if not self.project.path:
+            self.save_project_as()
             return
-        self.save_project_as()
+        current = Path(self.project.path)
+        migrated_from = None
+        if not is_project_bundle(current):
+            dest = current.parent / current.stem / PROJECT_FILENAME
+            if dest.is_file() and not self._confirm_replace_project(dest):
+                return
+            migrated_from = str(current)
+        self._commit_project_save(migrated_from=migrated_from)
 
     def save_project_as(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save project", "tutorial.json", "Tutorial project (*.json)"
-        )
-        if not path:
+        start = ""
+        if self.project.path:
+            start = str(Path(self.project.path).parent)
+        folder = QFileDialog.getExistingDirectory(self, "Choose a folder for this project", start)
+        if not folder:
             return
-        save_project(self.project, path)
-        self._set_status("Project saved.")
+        dest = Path(folder) / PROJECT_FILENAME
+        if dest.is_file() and not self._confirm_replace_project(dest):
+            return
+        self._commit_project_save(folder)
+
+    def _confirm_replace_project(self, dest: Path) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "Replace project",
+            f"{dest} already exists. Replace it?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _release_media_files(self) -> None:
+        self._pause_all()
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self.music_player.stop()
+        self.music_player.setSource(QUrl())
+
+    def _commit_project_save(self, dest: str | Path | None = None, *, migrated_from: str | None = None) -> None:
+        self._release_media_files()
+        try:
+            if dest is None:
+                saved, missing = save_project(self.project)
+            else:
+                saved, missing = save_project(self.project, dest)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save failed", str(exc))
+            self._show_current_media(force=True)
+            self._sync_music(force=True)
+            return
+        self._show_current_media(force=True)
+        self._sync_music(force=True)
+        self._finish_save(saved, missing, migrated_from=migrated_from)
+
+    def _finish_save(self, saved: Path, missing: list[str], *, migrated_from: str | None = None) -> None:
+        if migrated_from:
+            message = (
+                f"Project saved to {saved.parent}. "
+                f"The old file {Path(migrated_from).name} was left in place."
+            )
+        else:
+            message = "Project saved."
+        if missing:
+            message = f"{message} Missing files: {', '.join(missing)}"
+        self._set_status(message)
 
     def _restore_record_region_label(self) -> None:
         data = load_settings()
@@ -2682,7 +2805,8 @@ class MainWindow(QMainWindow):
         if not self._starting_record:
             return
         rect = getattr(self, "_pending_record_rect", self._current_capture_rect())
-        dest = new_recording_path()
+        record_dir = media_dir_for(self.project.path) if is_project_bundle(self.project.path) else None
+        dest = new_recording_path(record_dir)
         request = CaptureRequest(
             dest=dest,
             region=self._to_capture_region(rect),
