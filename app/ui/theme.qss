@@ -294,6 +294,12 @@ QScrollArea {
     background: #17181b;
 }
 
+QScrollArea#warningScroll,
+QScrollArea#warningScroll QWidget#qt_scrollarea_viewport {
+    background: transparent;
+    border: none;
+}
+
 QGroupBox {
     border: 1px solid #32343a;
     border-radius: 8px;

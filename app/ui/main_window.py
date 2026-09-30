@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -23,6 +24,8 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSlider,
     QSplitter,
     QTableWidget,
@@ -68,7 +71,7 @@ from app.engine.script import (
 )
 from app.engine.settings import cache_dir, load_settings, save_settings
 from app.engine.timeline import TimelinePlan, build_timeline
-from app.engine.translate import LANGUAGE_NAMES, translate_cues
+from app.engine.translate import LANGUAGE_NAMES, estimate_keep_terms, translate_cues
 from app.engine.tts import is_cached, synthesize, synthesize_with_duration
 from app.engine.voices import (
     fallback_edge_voices,
@@ -77,6 +80,7 @@ from app.engine.voices import (
     matching_voice,
 )
 from app.ui.camera_window import CameraWindow
+from app.ui.keep_terms_dialog import KeepTermsDialog
 from app.ui.preview_canvas import PreviewCanvas
 from app.ui.record_page import RecordPage
 from app.ui.region_frame import RegionFrame, screen_at_index
@@ -85,6 +89,70 @@ from app.ui.timeline_widget import TimelineWidget
 from app.ui.voice_cue import VoiceCuePlayer
 from app.ui.win_hotkey import WinRecordHotkeys
 from app.ui.workers import TaskWorker
+
+
+class _WarningNotes(QScrollArea):
+    """Yellow timing notes under the script table.
+
+    The block grows with the text only up to a few lines, then scrolls,
+    so a long hold list cannot shrink the spoken-text table.
+    """
+
+    _CAP = 88
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("warningScroll")
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.viewport().setAutoFillBackground(False)
+        self._label = QLabel()
+        self._label.setObjectName("warningLabel")
+        self._label.setWordWrap(True)
+        self._label.setTextFormat(Qt.TextFormat.PlainText)
+        self._label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.setWidget(self._label)
+        self._fitted = -1
+        self.setVisible(False)
+        self.setFixedHeight(0)
+
+    def setText(self, text: str) -> None:
+        self._label.setText(text)
+        self._fit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit()
+
+    def _fit(self) -> None:
+        text = self._label.text().strip()
+        if not text:
+            if self._fitted != 0:
+                self._fitted = 0
+                self.setFixedHeight(0)
+            self.setVisible(False)
+            return
+        width = self.viewport().width()
+        if width < 40:
+            width = max(self.width(), 160)
+        content = self._text_height(width)
+        if content > self._CAP:
+            bar = self.verticalScrollBar().sizeHint().width()
+            content = self._text_height(max(40, width - bar))
+        height = min(self._CAP, max(content + 4, 20))
+        self.setVisible(True)
+        if height != self._fitted:
+            self._fitted = height
+            self.setFixedHeight(height)
+
+    def _text_height(self, width: int) -> int:
+        flags = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap)
+        rect = self._label.fontMetrics().boundingRect(0, 0, width, 10_000, flags, self._label.text())
+        return rect.height()
 
 
 class MainWindow(QMainWindow):
@@ -352,6 +420,8 @@ class MainWindow(QMainWindow):
         self.cue_table.verticalHeader().setVisible(False)
         self.cue_table.verticalHeader().setDefaultSectionSize(22)
         self.cue_table.setShowGrid(False)
+        self.cue_table.setMinimumHeight(96)
+        self.cue_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         script_box.addWidget(self.cue_table, 1)
         cue_btns = QHBoxLayout()
         cue_btns.setSpacing(4)
@@ -360,10 +430,8 @@ class MainWindow(QMainWindow):
         cue_btns.addWidget(self.add_cue_btn)
         cue_btns.addWidget(self.remove_cue_btn)
         script_box.addLayout(cue_btns)
-        self.warning_label = QLabel()
-        self.warning_label.setObjectName("warningLabel")
-        self.warning_label.setWordWrap(True)
-        script_box.addWidget(self.warning_label)
+        self.warning_label = _WarningNotes()
+        script_box.addWidget(self.warning_label, 0)
         script_btns = QHBoxLayout()
         script_btns.setSpacing(4)
         self.generate_btn = QPushButton("Generate voices")
@@ -2412,10 +2480,14 @@ class MainWindow(QMainWindow):
             return
         target = choice.rsplit("(", 1)[-1].rstrip(")")
         language = LANGUAGE_NAMES.get(target, target)
+        dialog = KeepTermsDialog(estimate_keep_terms(cues), self)
+        if not dialog.exec():
+            return
+        keep_terms = dialog.selected_terms()
 
         def work(progress):
             progress(f"Translating script to {language}...")
-            return target, translate_cues(cues, target, key)
+            return target, translate_cues(cues, target, key, keep_terms)
 
         self.translate_btn.setEnabled(False)
         self._start_worker(work, self._translated)
