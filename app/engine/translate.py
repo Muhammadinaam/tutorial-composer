@@ -110,11 +110,12 @@ def estimate_keep_terms(cues: list[Cue]) -> list[KeepCandidate]:
     for cue in cues:
         text = cue.text or ""
         for start, end, term in _candidate_spans(text):
-            key = " ".join(term.split()).casefold()
+            base = _base_term(term)
+            key = base.casefold()
             if not key or key in seen:
                 continue
             seen.add(key)
-            found.append(KeepCandidate(term=" ".join(term.split()), quote=_quote(text, start, end)))
+            found.append(KeepCandidate(term=base, quote=_quote(text, start, end)))
     return found
 
 
@@ -215,6 +216,72 @@ def translate_cues(
     return translated
 
 
+def polish_cues(cues: list[Cue], lang: str, api_key: str) -> list[Cue]:
+    """Fix wording, and rewrite any line that is not in ``lang`` into that language."""
+    if not api_key:
+        raise ValueError("Add an OpenAI API key in Settings to fix the narration language.")
+    if not cues:
+        raise ValueError("There is no narration to fix.")
+
+    from openai import OpenAI
+
+    language = LANGUAGE_NAMES.get(lang, lang)
+    payload = [{"index": index, "text": cue.text} for index, cue in enumerate(cues)]
+    system = (
+        "You clean up spoken tutorial narration so every line is in the target language. "
+        "Handle each item on its own. "
+        "If a line is already in the target language, fix grammar, spelling, and awkward phrasing. "
+        "If a line is in any other language, rewrite it into the target language. "
+        "Romanized text counts as that language: Roman Urdu and Roman Hindi are not English. "
+        "Keep the same meaning, spoken tutorial tone, product names, and on-screen labels. "
+        "Do not merge, split, or add lines. "
+        'Return JSON: {"items":[{"index":0,"text":"..."}]}'
+    )
+    client = OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.2,
+        max_tokens=4000,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": (
+                    f"Target language: {language}.\n"
+                    + json.dumps(payload, ensure_ascii=False)
+                ),
+            },
+        ],
+    )
+    content = response.choices[0].message.content or "{}"
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError("The model did not return narration that could be read.") from exc
+    items = data.get("items") or data.get("cues") or data.get("lines") or []
+    by_index: dict[int, str] = {}
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                by_index[int(item["index"])] = str(item.get("text") or "").strip()
+            except (KeyError, TypeError, ValueError):
+                continue
+    polished: list[Cue] = []
+    for index, cue in enumerate(cues):
+        text = by_index.get(index) or cue.text
+        polished.append(
+            Cue(
+                video_time=cue.video_time,
+                text=text,
+                should_video_stop=cue.should_video_stop,
+            )
+        )
+    return polished
+
+
 def _candidate_spans(text: str) -> list[tuple[int, int, str]]:
     occupied: list[tuple[int, int]] = []
     found: list[tuple[int, int, str]] = []
@@ -231,7 +298,7 @@ def _candidate_spans(text: str) -> list[tuple[int, int, str]]:
             take(match.start(), match.start() + len(raw), raw)
 
     for phrase in sorted(_LEXICON, key=len, reverse=True):
-        for match in re.finditer(_boundary(phrase), text, flags=re.IGNORECASE):
+        for match in re.finditer(_inflected_boundary(phrase), text, flags=re.IGNORECASE):
             take(match.start(), match.end(), text[match.start() : match.end()])
 
     for match in _TOKEN.finditer(text):
@@ -254,17 +321,18 @@ def _term_spans(text: str, terms: list[str]) -> list[tuple[int, int, str]]:
         cleaned = " ".join(term.split())
         if not cleaned:
             continue
-        key = cleaned.casefold()
+        base = _base_term(cleaned)
+        key = base.casefold()
         if key in seen:
             continue
         seen.add(key)
-        unique.append(cleaned)
+        unique.append(base)
     unique.sort(key=len, reverse=True)
 
     occupied: list[tuple[int, int]] = []
     spans: list[tuple[int, int, str]] = []
     for term in unique:
-        for match in re.finditer(_boundary(term), text, flags=re.IGNORECASE):
+        for match in re.finditer(_inflected_boundary(term), text, flags=re.IGNORECASE):
             if _overlaps(match.start(), match.end(), occupied):
                 continue
             occupied.append((match.start(), match.end()))
@@ -276,6 +344,70 @@ def _term_spans(text: str, terms: list[str]) -> list[tuple[int, int, str]]:
 def _boundary(term: str) -> str:
     parts = [re.escape(part) for part in term.split()]
     return rf"(?<![A-Za-z0-9_]){r'\s+'.join(parts)}(?![A-Za-z0-9_])"
+
+
+def _inflected_boundary(term: str) -> str:
+    """Match a term and its simple plural, such as branch and branches."""
+    parts = term.split()
+    if not parts:
+        return _boundary(term)
+    last = _base_word(parts[-1])
+    head = [re.escape(part) for part in parts[:-1]]
+    if "_" in last and re.fullmatch(r"[A-Za-z]+(?:_[A-Za-z]+)+", last):
+        head.append(rf"{re.escape(last)}(?:s)?")
+    elif _can_inflect(last):
+        head.append(_inflection_regex(last))
+    else:
+        head.append(re.escape(parts[-1]))
+    return rf"(?<![A-Za-z0-9_]){r'\s+'.join(head)}(?![A-Za-z0-9_])"
+
+
+def _base_term(term: str) -> str:
+    parts = " ".join(term.split()).split(" ")
+    if not parts:
+        return term
+    return " ".join([*parts[:-1], _base_word(parts[-1])])
+
+
+def _base_word(word: str) -> str:
+    if word.casefold() in _LEXICON_KEYS:
+        return word
+    if "_" in word and re.fullmatch(r"[A-Za-z]+(?:_[A-Za-z]+)+", word):
+        folded = word.casefold()
+        if folded.endswith("s") and not folded.endswith("ss") and not word.endswith("_"):
+            return word[:-1]
+        return word
+    return _singular_token(word)
+
+
+def _can_inflect(word: str) -> bool:
+    if not re.fullmatch(r"[A-Za-z]{3,}", word):
+        return False
+    return word.casefold() not in {"gps", "css", "https"}
+
+
+def _inflection_regex(base: str) -> str:
+    folded = base.casefold()
+    if re.search(r"(?:ch|sh|[sxz])$", folded):
+        return rf"{re.escape(base)}(?:es)?"
+    if re.search(r"[^aeiou]y$", folded):
+        return rf"{re.escape(base[:-1])}(?:y|ies)"
+    return rf"{re.escape(base)}(?:s)?"
+
+
+def _singular_token(word: str) -> str:
+    if not _can_inflect(word):
+        return word
+    lower = word.casefold()
+    if lower.endswith("ies") and len(lower) > 4 and lower[-4] not in "aeiou":
+        return word[:-3] + ("Y" if word[-3].isupper() else "y")
+    if re.search(r"(?:ch|sh|[sxz])es$", lower) and not lower.endswith("yses"):
+        return word[:-2]
+    if lower.endswith("s") and not lower.endswith(("ss", "sis", "us")):
+        stem = word[:-1]
+        if len(stem) >= 3 and stem.casefold() not in _STOPWORDS:
+            return stem
+    return word
 
 
 def _overlaps(start: int, end: int, occupied: list[tuple[int, int]]) -> bool:

@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.engine.translate import KeepCandidate
+from app.engine.translate import KeepCandidate, _base_term
 
 
 class KeepTermsDialog(QDialog):
@@ -28,7 +28,8 @@ class KeepTermsDialog(QDialog):
         self._rows: list[tuple[QCheckBox, str]] = []
 
         hint = QLabel(
-            "Checked words stay in English. Uncheck any word that should be translated."
+            "Checked words stay in English, including a simple plural such as branches. "
+            "Uncheck any word that should be translated."
         )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
@@ -85,7 +86,7 @@ class KeepTermsDialog(QDialog):
         return chosen
 
     def _add_from_field(self) -> None:
-        term = " ".join(self._add_edit.text().split())
+        term = _base_term(" ".join(self._add_edit.text().split()))
         if not term:
             return
         existing = self._row_for(term)
@@ -112,9 +113,9 @@ class KeepTermsDialog(QDialog):
         self._rows.append((box, term))
 
     def _row_for(self, term: str) -> QCheckBox | None:
-        key = term.casefold()
+        key = _base_term(term).casefold()
         for box, existing in self._rows:
-            if existing.casefold() == key:
+            if _base_term(existing).casefold() == key:
                 return box
         return None
 

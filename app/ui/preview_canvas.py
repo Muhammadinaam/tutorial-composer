@@ -11,6 +11,7 @@ class PreviewCanvas(QWidget):
     """Letterboxed preview that can blur rectangles on the current frame."""
 
     gestureStarted = Signal()
+    gestureFinished = Signal()
     blurDrawn = Signal(float, float, float, float)
     blurSelected = Signal(str)
     blurRectEdited = Signal(str, float, float, float, float)
@@ -335,7 +336,11 @@ class PreviewCanvas(QWidget):
         drag = self._drag
         self._drag = None
         self.setCursor(Qt.CursorShape.CrossCursor if self._draw_mode else Qt.CursorShape.ArrowCursor)
-        if not drag or drag.get("mode") != "draw":
+        if not drag:
+            self.update()
+            return
+        if drag.get("mode") != "draw":
+            self.gestureFinished.emit()
             self.update()
             return
         x0, y0 = drag["x0"], drag["y0"]
@@ -343,8 +348,8 @@ class PreviewCanvas(QWidget):
         width = abs(x1 - x0)
         height = abs(y1 - y0)
         self.update()
-        if width < 0.02 or height < 0.02:
-            return
-        region = BlurRegion(start=0.0, end=1.0, x=min(x0, x1), y=min(y0, y1), w=width, h=height)
-        region.clamp()
-        self.blurDrawn.emit(region.x, region.y, region.w, region.h)
+        if width >= 0.02 and height >= 0.02:
+            region = BlurRegion(start=0.0, end=1.0, x=min(x0, x1), y=min(y0, y1), w=width, h=height)
+            region.clamp()
+            self.blurDrawn.emit(region.x, region.y, region.w, region.h)
+        self.gestureFinished.emit()

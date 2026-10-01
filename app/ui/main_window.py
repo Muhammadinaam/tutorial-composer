@@ -38,18 +38,22 @@ from PySide6.QtWidgets import (
 )
 
 from app.engine.capture import CaptureRegion, CaptureRequest, ScreenRecorder, even, new_recording_path
-from app.engine.describe import describe_timeline
 from app.engine.edl import (
     clip_joined_start,
     delete_joined_range,
     joined_duration,
-    ripple_blurs,
-    ripple_cues,
     map_joined_to_clip,
     probe_audio,
     probe_clip,
+    remap_blurs,
+    remap_cues,
+    remap_joined_time,
+    reorder_clip,
+    ripple_blurs,
+    ripple_cues,
     split_clip,
 )
+from app.engine.history import EditHistory
 from app.engine.export import export_project
 from app.engine.ffmpeg import ffmpeg_available
 from app.engine.project import (
@@ -71,7 +75,7 @@ from app.engine.script import (
 )
 from app.engine.settings import cache_dir, load_settings, save_settings
 from app.engine.timeline import TimelinePlan, build_timeline
-from app.engine.translate import LANGUAGE_NAMES, estimate_keep_terms, translate_cues
+from app.engine.translate import LANGUAGE_NAMES, estimate_keep_terms, polish_cues, translate_cues
 from app.engine.tts import is_cached, synthesize, synthesize_with_duration
 from app.engine.voices import (
     fallback_edge_voices,
@@ -190,6 +194,11 @@ class MainWindow(QMainWindow):
         self._joining = False
         self._music_selected = False
         self._selected_blur_id = ""
+        self._selected_cue = -1
+        self._cue_drag_cue: Cue | None = None
+        self._reorder_dirty = False
+        self._restoring = False
+        self._history = EditHistory()
         self.tts_store: dict[str, tuple] = {}
         self._loading_table = False
         self._switching_lang = False
@@ -436,13 +445,14 @@ class MainWindow(QMainWindow):
         script_btns.setSpacing(4)
         self.generate_btn = QPushButton("Generate voices")
         self.generate_btn.setObjectName("accentButton")
-        self.describe_btn = QPushButton("Describe video")
-        self.describe_btn.setToolTip(
-            "Write narration for this language from the picture, using the OpenAI key"
+        self.fix_btn = QPushButton("Fix language")
+        self.fix_btn.setToolTip(
+            "Fix grammar and wording. A line in another language, including Roman Urdu, "
+            "is rewritten into this tab's language."
         )
         self.translate_btn = QPushButton("Translate")
         script_btns.addWidget(self.generate_btn)
-        script_btns.addWidget(self.describe_btn)
+        script_btns.addWidget(self.fix_btn)
         script_btns.addWidget(self.translate_btn)
         script_box.addLayout(script_btns)
         side_box.addWidget(script_panel, 1)
@@ -472,8 +482,12 @@ class MainWindow(QMainWindow):
         )
         self.delete_range_btn = QPushButton("Delete In→Out")
         self.delete_range_btn.setToolTip("Ripple-delete the middle between yellow marks.")
-        self.delete_btn = QPushButton("Delete clip")
-        self.delete_btn.setToolTip("Remove the selected blur, video, image, or music.")
+        self.delete_btn = QPushButton("Delete")
+        self.delete_btn.setToolTip("Remove the selected narration line, blur, video, image, or music.")
+        self.undo_btn = QPushButton("Undo")
+        self.undo_btn.setToolTip("Undo the last edit (Ctrl+Z)")
+        self.redo_btn = QPushButton("Redo")
+        self.redo_btn.setToolTip("Redo the edit you just undid (Ctrl+Y)")
         for btn in (
             self.add_video_btn,
             self.add_image_btn,
@@ -485,6 +499,8 @@ class MainWindow(QMainWindow):
             self.blur_btn,
             self.delete_range_btn,
             self.delete_btn,
+            self.undo_btn,
+            self.redo_btn,
         ):
             tools.addWidget(btn)
         tools.addStretch()
@@ -529,9 +545,9 @@ class MainWindow(QMainWindow):
         tl_box.addLayout(mix_row)
         self.timeline = TimelineWidget()
         self.timeline.setToolTip(
-            "Mark In / Mark Out / Delete In→Out to cut the middle. "
-            "Blur, then drag on the preview. Drag a purple bar to change when the blur shows. "
-            "Or Split twice and Delete clip. Drag the red line to scrub."
+            "Drag a video to change its order. Drag a narration line to change when it starts. "
+            "Click a block, then Delete to remove it. Drag the edges of a clip to trim. "
+            "Drag the red line, or empty track, to scrub."
         )
         tl_box.addWidget(self.timeline)
         vertical.addWidget(timeline_panel)
@@ -580,12 +596,15 @@ class MainWindow(QMainWindow):
         self.add_music_btn.clicked.connect(self.add_music)
         self.remove_music_btn.clicked.connect(self.remove_music)
         self.delete_btn.clicked.connect(self.remove_clip)
+        self.undo_btn.clicked.connect(self.undo_edit)
+        self.redo_btn.clicked.connect(self.redo_edit)
         self.split_btn.clicked.connect(self.split_at_playhead)
         self.mark_in_btn.clicked.connect(self.mark_in)
         self.mark_out_btn.clicked.connect(self.mark_out)
         self.blur_btn.toggled.connect(self._blur_tool_toggled)
         self.delete_range_btn.clicked.connect(self.delete_marked_range)
-        self.preview.gestureStarted.connect(self._pause_for_blur_edit)
+        self.preview.gestureStarted.connect(self._preview_gesture_started)
+        self.preview.gestureFinished.connect(self._on_edit_finished)
         self.preview.blurDrawn.connect(self._add_blur_from_draw)
         self.preview.blurSelected.connect(self._on_blur_selected)
         self.preview.blurRectEdited.connect(self._blur_rect_edited)
@@ -609,13 +628,20 @@ class MainWindow(QMainWindow):
         self.voice_combo.currentIndexChanged.connect(self._voice_changed)
         self.preview_voice_btn.clicked.connect(self.preview_voice)
         self.generate_btn.clicked.connect(self.generate_voices)
-        self.describe_btn.clicked.connect(self.describe_video)
+        self.fix_btn.clicked.connect(self.fix_language)
         self.translate_btn.clicked.connect(self.translate_script)
         self.export_btn.clicked.connect(self.export_video)
         self.timeline.clipSelected.connect(self._timeline_clip_selected)
         self.timeline.playheadMoved.connect(self._timeline_seek)
         self.timeline.playheadReleased.connect(self._timeline_seek_done)
         self.timeline.clipsTrimmed.connect(self._after_trim)
+        self.timeline.editStarted.connect(self._begin_edit)
+        self.timeline.editFinished.connect(self._on_edit_finished)
+        self.timeline.clipReordered.connect(self._on_clip_reordered)
+        self.timeline.cueSelected.connect(self._timeline_cue_selected)
+        self.timeline.cueDragged.connect(self._on_cue_dragged)
+        self.cue_table.currentCellChanged.connect(self._on_cue_table_row)
+        self._update_history_buttons()
         self._warn_timer = QTimer(self)
         self._warn_timer.setSingleShot(True)
         self._warn_timer.setInterval(400)
@@ -640,15 +666,35 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched, event) -> bool:
         if event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
+            if self._handle_history_shortcut(event):
+                return True
             if self._handle_editor_shortcut(event):
                 return True
         return False
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        if self._handle_editor_shortcut(event):
+        if self._handle_history_shortcut(event) or self._handle_editor_shortcut(event):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def _handle_history_shortcut(self, event: QKeyEvent) -> bool:
+        if not self.isActiveWindow() or self._typing_focus():
+            return False
+        mods = event.modifiers()
+        if not (mods & Qt.KeyboardModifier.ControlModifier):
+            return False
+        if mods & (Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier):
+            return False
+        key = event.key()
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        if key == Qt.Key.Key_Z and not shift:
+            self.undo_edit()
+            return True
+        if key == Qt.Key.Key_Y or (key == Qt.Key.Key_Z and shift):
+            self.redo_edit()
+            return True
+        return False
 
     def _typing_focus(self) -> bool:
         widget = QApplication.focusWidget()
@@ -686,7 +732,10 @@ class MainWindow(QMainWindow):
             if item is not None and item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
                 return False
         if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self.cue_table.hasFocus():
-            return False
+            if self.cue_table.state() == QAbstractItemView.State.EditingState:
+                return False
+            self.remove_selected_cue()
+            return True
         if key == Qt.Key.Key_I:
             self.mark_in()
         elif key == Qt.Key.Key_O:
@@ -745,7 +794,7 @@ class MainWindow(QMainWindow):
         self._hide_export_progress()
         self.generate_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
-        self.describe_btn.setEnabled(True)
+        self.fix_btn.setEnabled(True)
         self.translate_btn.setEnabled(True)
         self.preview_voice_btn.setEnabled(True)
 
@@ -983,10 +1032,14 @@ class MainWindow(QMainWindow):
         self._show_current_media(force=True)
 
     def refresh_timeline(self) -> None:
-        if self.project.clips:
-            self.selected_index = min(max(self.selected_index, 0), len(self.project.clips) - 1)
-        else:
+        count = len(self.project.clips)
+        if count == 0:
             self.selected_index = -1
+        elif self.selected_index >= count:
+            self.selected_index = count - 1
+        spoken = self._spoken_cues()
+        if self._selected_cue >= len(spoken):
+            self._selected_cue = -1
         self.timeline.set_state(
             self.project.clips,
             self.selected_index,
@@ -1000,6 +1053,7 @@ class MainWindow(QMainWindow):
             mark_out=self.project.mark_out,
             blurs=self.project.blurs,
             selected_blur=self._selected_blur_id,
+            selected_cue=self._selected_cue,
         )
         blur = self._selected_blur()
         if blur:
@@ -1008,6 +1062,9 @@ class MainWindow(QMainWindow):
             )
         elif self._music_selected and self.project.music_path:
             self.selected_label.setText(f"Music: {Path(self.project.music_path).name}")
+        elif 0 <= self._selected_cue < len(spoken):
+            text = spoken[self._selected_cue].text.strip() or "Narration"
+            self.selected_label.setText(f"Line: {text[:48]}")
         else:
             clip = self.current_clip()
             if clip:
@@ -1058,21 +1115,21 @@ class MainWindow(QMainWindow):
     def _timeline_clip_selected(self, index: int) -> None:
         self._music_selected = False
         self._selected_blur_id = ""
+        self._selected_cue = -1
         self.selected_index = index
-        clip = self.current_clip()
-        if clip:
-            kind = "Image" if clip.is_image else "Video"
-            self.selected_label.setText(f"{kind}: {clip.name}")
+        self.refresh_timeline()
 
     def _music_track_selected(self) -> None:
         self._music_selected = True
         self._selected_blur_id = ""
+        self._selected_cue = -1
         self.selected_index = -1
         if self.project.music_path:
             self.selected_label.setText(f"Music: {Path(self.project.music_path).name}")
         self.refresh_timeline()
 
     def _timeline_seek(self, seconds: float) -> None:
+        self._selected_cue = -1
         self.player.pause()
         self._image_clock.stop()
         if not self._scrubbing:
@@ -1092,6 +1149,223 @@ class MainWindow(QMainWindow):
         self.refresh_warnings()
         self._refresh_transport()
         self.refresh_timeline()
+
+    def _snapshot(self) -> dict:
+        tts = {}
+        for lang, stored in self.tts_store.items():
+            paths, durations, plan = stored
+            tts[lang] = (list(paths), list(durations), plan)
+        return {"project": self.project.to_dict(), "tts": tts}
+
+    def _begin_edit(self) -> None:
+        if self._restoring:
+            return
+        if self._history.pending is None and (self._playing or self._warming):
+            self._pause_all()
+        self._history.begin(self._snapshot())
+
+    def _commit_edit(self) -> None:
+        if self._restoring:
+            self._history.cancel()
+            return
+        self._history.commit(self._snapshot())
+        self._update_history_buttons()
+
+    def _update_history_buttons(self) -> None:
+        self.undo_btn.setEnabled(self._history.can_undo())
+        self.redo_btn.setEnabled(self._history.can_redo())
+
+    def undo_edit(self) -> None:
+        if self._typing_focus() or self._restoring or self._busy():
+            return
+        if self._history.pending is not None:
+            self._commit_edit()
+        previous = self._history.undo(self._snapshot())
+        if previous is None:
+            self._update_history_buttons()
+            return
+        self._apply_history_snapshot(previous)
+        self._set_status("Undid the last edit.")
+
+    def redo_edit(self) -> None:
+        if self._typing_focus() or self._restoring or self._busy():
+            return
+        if self._history.pending is not None:
+            self._commit_edit()
+        nxt = self._history.redo(self._snapshot())
+        if nxt is None:
+            self._update_history_buttons()
+            return
+        self._apply_history_snapshot(nxt)
+        self._set_status("Redid the last edit.")
+
+    def _apply_history_snapshot(self, snap: dict) -> None:
+        self._restoring = True
+        if self._playing or self._warming:
+            self._pause_all()
+        self.voice_sfx.stop()
+        self._narration_index = -1
+        self._narration_finished = -1
+        self._narration_pending = None
+        self._narration_gen += 1
+        self._audio_hold = False
+        self._waiting_for_voice = False
+        self._discard_video_freeze()
+        restored = Project.from_dict(snap["project"], path=self.project.path)
+        self.project = restored
+        self.tts_store = {}
+        for lang, stored in snap.get("tts", {}).items():
+            paths, durations, plan = stored
+            if paths and all(Path(path).is_file() for path in paths):
+                self.tts_store[lang] = (list(paths), list(durations), plan)
+        self._selected_cue = -1
+        self._cue_drag_cue = None
+        self._music_selected = False
+        self._selected_blur_id = ""
+        self.selected_index = 0 if self.project.clips else -1
+        self.playhead = min(self.playhead, joined_duration(self.project.clips))
+        self.refresh_all()
+        self._restoring = False
+        self._update_history_buttons()
+
+    def _preview_gesture_started(self) -> None:
+        self._pause_for_blur_edit()
+        self._begin_edit()
+
+    def _on_edit_finished(self) -> None:
+        cue_drag = self._cue_drag_cue is not None
+        self._finish_cue_drag()
+        if self._reorder_dirty:
+            self._reorder_dirty = False
+            self._load_cues_into_table()
+            self.refresh_warnings()
+            self._refresh_transport()
+            self._show_current_media(force=True)
+        elif not cue_drag:
+            self._refresh_transport()
+            self.refresh_timeline()
+        self._commit_edit()
+
+    def _on_clip_reordered(self, clip_id: str, dest: int) -> None:
+        clips = self.project.clips
+        source = next((index for index, clip in enumerate(clips) if clip.id == clip_id), -1)
+        if source < 0 or source == dest:
+            return
+        old = list(clips)
+        new = reorder_clip(old, source, dest)
+        self._remap_project_times(old, new)
+        self.project.clips = new
+        self.selected_index = next(index for index, clip in enumerate(new) if clip.id == clip_id)
+        self._selected_cue = -1
+        self._music_selected = False
+        self._reorder_dirty = True
+        self.refresh_timeline()
+
+    def _remap_project_times(self, old: list, new: list) -> None:
+        for narration in self.project.narrations.values():
+            narration.cues = remap_cues(old, new, narration.cues)
+        self.project.blurs = remap_blurs(old, new, self.project.blurs)
+        if self.project.mark_in is not None:
+            self.project.mark_in = remap_joined_time(old, new, self.project.mark_in)
+        if self.project.mark_out is not None:
+            self.project.mark_out = remap_joined_time(old, new, self.project.mark_out)
+        self.project.sync_from_current()
+        self._remap_stored_voices(new)
+
+    def _remap_stored_voices(self, clips: list) -> None:
+        duration = joined_duration(clips)
+        for lang, narration in list(self.project.narrations.items()):
+            stored = self.tts_store.get(lang)
+            if not stored:
+                continue
+            paths, durations, _plan = stored
+            spoken = [cue for cue in narration.cues if cue.text.strip()]
+            if len(durations) != len(spoken):
+                self.tts_store.pop(lang, None)
+                if lang == self.project.lang:
+                    self.tts_paths = []
+                    self.tts_durations = []
+                    self.plan = None
+                continue
+            plan = build_timeline(spoken, list(durations), duration)
+            self.tts_store[lang] = (list(paths), list(durations), plan)
+            if lang == self.project.lang:
+                self.tts_paths = list(paths)
+                self.tts_durations = list(durations)
+                self.plan = plan
+
+    def _timeline_cue_selected(self, index: int) -> None:
+        self._selected_cue = index
+        if index < 0:
+            self.refresh_timeline()
+            return
+        self._music_selected = False
+        self._selected_blur_id = ""
+        self.selected_index = -1
+        if 0 <= index < self.cue_table.rowCount():
+            self.cue_table.setCurrentCell(index, 1)
+        self.refresh_timeline()
+
+    def _on_cue_table_row(self, row: int, _column: int, _previous_row: int, _previous_column: int) -> None:
+        if self._loading_table or self._restoring or row < 0:
+            return
+        if row == self._selected_cue and self.selected_index < 0 and not self._music_selected:
+            return
+        self._selected_cue = row
+        self._music_selected = False
+        self._selected_blur_id = ""
+        self.selected_index = -1
+        self.refresh_timeline()
+
+    def _on_cue_dragged(self, index: int, time: float) -> None:
+        cues = self._spoken_cues()
+        if not (0 <= index < len(cues)):
+            return
+        cue = cues[index]
+        cue.video_time = max(0.0, time)
+        self._cue_drag_cue = cue
+        self._selected_cue = index
+
+    def _finish_cue_drag(self) -> None:
+        cue = self._cue_drag_cue
+        self._cue_drag_cue = None
+        if cue is None:
+            return
+        current = self.project.current()
+        current.cues = sorted(current.cues, key=lambda item: item.video_time)
+        self.project.sync_from_current()
+        spoken = self._spoken_cues()
+        try:
+            self._selected_cue = spoken.index(cue)
+        except ValueError:
+            self._selected_cue = -1
+        if spoken and len(self.tts_durations) == len(spoken):
+            self._rebuild_plan_from_tts()
+        else:
+            self.plan = None
+            self.tts_store.pop(self.project.lang, None)
+        self._load_cues_into_table()
+        if 0 <= self._selected_cue < self.cue_table.rowCount():
+            self.cue_table.setCurrentCell(self._selected_cue, 1)
+        self.refresh_timeline()
+        self.refresh_warnings()
+
+    def _remove_cue_block(self, index: int) -> None:
+        cues = [cue for cue in self.project.current().cues if cue.text.strip()]
+        if not (0 <= index < len(cues)):
+            return
+        target = cues[index]
+        self._begin_edit()
+        current = self.project.current()
+        current.cues = [cue for cue in current.cues if cue is not target]
+        self.project.sync_from_current()
+        self._selected_cue = -1
+        self._clear_tts(self.project.lang)
+        self._load_cues_into_table()
+        self.refresh_timeline()
+        self.refresh_warnings()
+        self._commit_edit()
+        self._set_status("Narration line removed.")
 
     def _seek_joined(self, seconds: float, keep_playing: bool = False, live: bool = False) -> None:
         total = joined_duration(self.project.clips)
@@ -1209,26 +1483,35 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Music", str(exc))
             return
+        self._begin_edit()
         self.project.music_path = path
         self.project.music_duration = duration
         self._music_selected = True
         self._refresh_music_ui()
         self.refresh_timeline()
         self._sync_music()
+        self._commit_edit()
         self._set_status(f"Soundtrack: {Path(path).name}")
 
     def remove_music(self) -> None:
+        if not self.project.music_path:
+            self._music_selected = False
+            self.refresh_timeline()
+            return
+        self._begin_edit()
         self.project.music_path = None
         self.project.music_duration = 0.0
         self._music_selected = False
         self.music_player.stop()
         self._refresh_music_ui()
         self.refresh_timeline()
+        self._commit_edit()
         self._set_status("Soundtrack removed.")
 
     def _add_media(self, files: list[str]) -> None:
         if not files:
             return
+        self._begin_edit()
         errors = []
         for path in files:
             try:
@@ -1241,6 +1524,7 @@ class MainWindow(QMainWindow):
         self.refresh_warnings()
         self._refresh_transport()
         self._show_current_media(force=True)
+        self._commit_edit()
         if errors:
             QMessageBox.warning(self, "Some files were skipped", "\n".join(errors))
         elif files:
@@ -1248,14 +1532,22 @@ class MainWindow(QMainWindow):
 
     def remove_clip(self) -> None:
         if self._selected_blur_id:
-            self._delete_selected_blur()
+            self._begin_edit()
+            if not self._delete_selected_blur():
+                self._history.cancel()
+                return
+            self._commit_edit()
             return
         if self._music_selected:
             self.remove_music()
             return
+        if self._selected_cue >= 0:
+            self._remove_cue_block(self._selected_cue)
+            return
         index = self.selected_index
         if index < 0 or index >= len(self.project.clips):
             return
+        self._begin_edit()
         del self.project.clips[index]
         if not self.project.clips:
             self.selected_index = -1
@@ -1267,6 +1559,7 @@ class MainWindow(QMainWindow):
         self.refresh_warnings()
         self._refresh_transport()
         self._show_current_media(force=True)
+        self._commit_edit()
 
     def split_at_playhead(self) -> None:
         mapped = map_joined_to_clip(self.project.clips, self.playhead)
@@ -1274,13 +1567,17 @@ class MainWindow(QMainWindow):
             return
         clip, local, index = mapped
         before = len(self.project.clips)
+        self._begin_edit()
         self.project.clips = split_clip(self.project.clips, index, local)
         if len(self.project.clips) == before:
+            self._history.cancel()
             self._set_status("Move the red line onto a clip, then Split.")
             return
         self.selected_index = index + 1
+        self._selected_cue = -1
         self.refresh_timeline()
         self.refresh_warnings()
+        self._commit_edit()
         self._set_status("Split. Select the piece you do not want and press Delete.")
 
     def toggle_play(self) -> None:
@@ -1955,8 +2252,9 @@ class MainWindow(QMainWindow):
         self._save_tts()
 
     def _table_changed(self, *_args) -> None:
-        if self._loading_table:
+        if self._loading_table or self._restoring:
             return
+        self._begin_edit()
         cues = self._cues_from_table()
         spoken = [c for c in cues if c.text.strip()]
         current = self.project.current()
@@ -1970,6 +2268,7 @@ class MainWindow(QMainWindow):
             self._clear_tts(self.project.lang)
         elif before != after:
             self._rebuild_plan_from_tts()
+        self._commit_edit()
         self._warn_timer.start()
         self.refresh_timeline()
 
@@ -1986,6 +2285,7 @@ class MainWindow(QMainWindow):
         if row < 0:
             return
         self.cue_table.removeRow(row)
+        self._selected_cue = -1
         self._table_changed()
 
     def _rebuild_lang_tabs(self) -> None:
@@ -2186,6 +2486,7 @@ class MainWindow(QMainWindow):
         self._selected_blur_id = blur_id or ""
         if blur_id:
             self._music_selected = False
+            self._selected_cue = -1
         self.refresh_timeline()
         self._sync_preview_overlays()
 
@@ -2242,6 +2543,7 @@ class MainWindow(QMainWindow):
             return
         before = len(self.project.clips)
         lo, hi = min(start, end), max(start, end)
+        self._begin_edit()
         self.project.clips = delete_joined_range(self.project.clips, lo, hi)
         for narration in self.project.narrations.values():
             narration.cues = ripple_cues(narration.cues, lo, hi)
@@ -2251,6 +2553,7 @@ class MainWindow(QMainWindow):
         self.project.sync_from_current()
         self.project.mark_in = None
         self.project.mark_out = None
+        self._selected_cue = -1
         self.playhead = lo
         self._load_cues_into_table()
         spoken = self._spoken_cues()
@@ -2263,6 +2566,7 @@ class MainWindow(QMainWindow):
         self.refresh_warnings()
         self._refresh_transport()
         self._show_current_media(force=True)
+        self._commit_edit()
         if len(self.project.clips) == before and before:
             self._set_status("Nothing was inside those marks.")
         else:
@@ -2407,55 +2711,58 @@ class MainWindow(QMainWindow):
             f"{LANGUAGE_NAMES.get(self.project.lang, self.project.lang)}.{extra}"
         )
 
-    def describe_video(self) -> None:
-        if not self.project.clips:
-            QMessageBox.information(self, "Describe video", "Add a video first.")
+    def fix_language(self) -> None:
+        cues = [cue for cue in self._cues_from_table() if cue.text.strip()]
+        if not cues:
+            QMessageBox.information(self, "Fix language", "Write a narration line first.")
             return
         key = self.settings().get("openai_api_key", "")
         if not key:
             QMessageBox.information(
                 self,
-                "Describe video",
-                "Add an OpenAI API key in Settings to write narration from the video.",
+                "Fix language",
+                "Add an OpenAI API key in Settings to fix the narration language.",
             )
             return
-        self.project.current().cues = self._cues_from_table()
-        existing = [cue for cue in self.project.current().cues if cue.text.strip()]
-        if existing:
-            answer = QMessageBox.question(
-                self,
-                "Describe video",
-                "Replace the narration on this tab?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
         if self._busy():
             self.statusBar().showMessage("Please wait for the current task to finish.")
             return
         lang = self.project.lang
-        clips = list(self.project.clips)
 
         def work(progress):
-            return describe_timeline(clips, lang, key, on_progress=progress)
+            progress("Fixing narration…", 30)
+            updated = polish_cues(cues, lang, key)
+            progress("Narration updated.", 100)
+            return updated
 
-        self.describe_btn.setEnabled(False)
-        self._start_worker(work, self._described, progress_bar=True)
+        self.fix_btn.setEnabled(False)
+        self._start_worker(work, self._language_fixed, progress_bar=True)
 
-    def _described(self, cues) -> None:
-        self.describe_btn.setEnabled(True)
+    def _language_fixed(self, cues) -> None:
+        self.fix_btn.setEnabled(True)
+        previous = [(cue.video_time, cue.text, cue.should_video_stop) for cue in self.project.current().cues]
+        updated = [
+            (cue.video_time, cue.text, cue.should_video_stop) for cue in cues
+        ]
+        self._begin_edit()
         self.project.current().cues = list(cues)
         self.project.sync_from_current()
-        self._clear_tts(self.project.lang)
+        self._selected_cue = -1
+        if previous != updated:
+            self._clear_tts(self.project.lang)
         self._load_cues_into_table()
         self.refresh_warnings()
         self.refresh_timeline()
         self._sync_narration()
+        self._commit_edit()
         language = LANGUAGE_NAMES.get(self.project.lang, self.project.lang)
-        self._set_status(
-            f"Wrote {len(cues)} line(s) in {language} from the video. "
-            "Click Generate voices to speak them."
-        )
+        changed = sum(1 for old, new in zip(previous, updated) if old[1] != new[1])
+        if changed:
+            self._set_status(
+                f"Updated {changed} line(s) in {language}. Generate voices to speak the new wording."
+            )
+        else:
+            self._set_status(f"Narration in {language} did not need changes.")
 
     def translate_script(self) -> None:
         self.project.current().cues = self._cues_from_table()

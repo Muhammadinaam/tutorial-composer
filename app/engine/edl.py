@@ -91,6 +91,82 @@ def move_clip(clips: list[Clip], index: int, delta: int) -> list[Clip]:
     return updated
 
 
+def reorder_clip(clips: list[Clip], source: int, dest: int) -> list[Clip]:
+    """Place the clip at ``source`` so it lands at ``dest`` in the new list."""
+    if not clips or not (0 <= source < len(clips)):
+        return clips
+    dest = max(0, min(int(dest), len(clips) - 1))
+    if source == dest:
+        return clips
+    updated = list(clips)
+    clip = updated.pop(source)
+    updated.insert(dest, clip)
+    return updated
+
+
+def remap_joined_time(old_clips: list[Clip], new_clips: list[Clip], moment: float) -> float:
+    """Keep a timeline time on the same clip after that clip moves."""
+    if not old_clips:
+        return moment
+    if moment > joined_duration(old_clips) + 0.001:
+        return moment
+    acc = 0.0
+    owner_id = None
+    offset = 0.0
+    last = len(old_clips) - 1
+    for index, clip in enumerate(old_clips):
+        clip_end = acc + clip.used
+        if moment < clip_end - 0.0005 or index == last:
+            owner_id = clip.id
+            offset = max(0.0, moment - acc)
+            break
+        acc = clip_end
+    if owner_id is None:
+        return moment
+    acc = 0.0
+    for clip in new_clips:
+        if clip.id == owner_id:
+            return acc + min(max(0.0, offset), clip.used)
+        acc += clip.used
+    return moment
+
+
+def remap_cues(old_clips: list[Clip], new_clips: list[Clip], cues: list[Cue]) -> list[Cue]:
+    moved = [
+        Cue(
+            video_time=remap_joined_time(old_clips, new_clips, cue.video_time),
+            text=cue.text,
+            should_video_stop=cue.should_video_stop,
+        )
+        for cue in cues
+    ]
+    moved.sort(key=lambda cue: cue.video_time)
+    return moved
+
+
+def remap_blurs(
+    old_clips: list[Clip], new_clips: list[Clip], blurs: list[BlurRegion]
+) -> list[BlurRegion]:
+    total = joined_duration(new_clips)
+    moved: list[BlurRegion] = []
+    for blur in blurs:
+        duration = max(0.08, float(blur.end) - float(blur.start))
+        midpoint = (float(blur.start) + float(blur.end)) / 2.0
+        center = remap_joined_time(old_clips, new_clips, midpoint)
+        start = center - duration / 2.0
+        end = start + duration
+        if start < 0:
+            end -= start
+            start = 0.0
+        if total > 0 and end > total:
+            start = max(0.0, start - (end - total))
+            end = total
+        updated = replace(blur, start=start, end=max(start + 0.08, end))
+        updated.clamp()
+        moved.append(updated)
+    return moved
+
+
 def delete_joined_range(clips: list[Clip], start: float, end: float) -> list[Clip]:
     start, end = (min(start, end), max(start, end))
     if end - start < 0.05 or not clips:
