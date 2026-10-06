@@ -12,6 +12,8 @@ DEFAULTS = {
     "openai_api_key": "",
     "elevenlabs_api_key": "",
     "voice": "en-US-JennyNeural",
+    "voice_edge": "en-US-JennyNeural",
+    "voice_openai": "nova",
     "lang": "en",
     "record_monitor": 0,
     "record_camera_enabled": True,

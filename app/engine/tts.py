@@ -9,6 +9,7 @@ from app.engine.ffmpeg import audio_duration, run
 from app.engine.settings import cache_dir
 
 TTS_VOLUME = "+100%"
+OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
 TTS_PREP_FILTER = (
     "silenceremove=start_periods=1:start_threshold=-35dB:start_silence=0.02:detection=peak,"
     "aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo,"
@@ -22,8 +23,15 @@ _next_request_at = 0.0
 
 
 def cache_path(provider: str, voice: str, text: str, suffix: str) -> Path:
-    # Speaker (voice) and text are the identity. loud5 marks the post-process chain.
-    digest = hashlib.sha256(f"{provider}|{voice}|{text}|loud5".encode("utf-8")).hexdigest()[:20]
+    # Speaker (voice) and exact text are the identity. loud5 marks the post-process chain.
+    # The OpenAI model is part of the key so a repeat of the same line is reused
+    # and an older tts-1 file is not played as gpt-4o-mini-tts.
+    # Edge keeps the previous key so existing free clips stay valid.
+    if provider == "openai":
+        identity = f"{provider}|{OPENAI_TTS_MODEL}|{voice}|{text}|loud5"
+    else:
+        identity = f"{provider}|{voice}|{text}|loud5"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
     return cache_dir() / f"{provider}_{digest}{suffix}"
 
 
@@ -100,7 +108,7 @@ def synthesize_openai(text: str, voice: str, api_key: str, dest: Path) -> Path:
 
     client = OpenAI(api_key=api_key)
     response = client.audio.speech.create(
-        model="tts-1",
+        model=OPENAI_TTS_MODEL,
         voice=voice,
         input=text,
     )

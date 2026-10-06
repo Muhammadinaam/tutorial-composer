@@ -394,10 +394,18 @@ class MainWindow(QMainWindow):
         script_box.setSpacing(4)
         voice_row = QHBoxLayout()
         voice_row.setSpacing(4)
+        self.tts_combo = QComboBox()
+        self.tts_combo.addItem("Edge", "edge-tts")
+        self.tts_combo.addItem("OpenAI", "openai")
+        self.tts_combo.setToolTip(
+            "Edge is free for drafts. OpenAI uses gpt-4o-mini-tts for the final voice. "
+            "Each line is saved, so generating the same text and voice again does not call the API."
+        )
         self.lang_combo = QComboBox()
         self.voice_combo = QComboBox()
         self.preview_voice_btn = QPushButton("Hear")
         self.preview_voice_btn.setToolTip("Play a short sample of this voice")
+        voice_row.addWidget(self.tts_combo)
         voice_row.addWidget(self.lang_combo, 1)
         voice_row.addWidget(self.voice_combo, 2)
         voice_row.addWidget(self.preview_voice_btn)
@@ -625,6 +633,7 @@ class MainWindow(QMainWindow):
         self.timeline.musicSelected.connect(self._music_track_selected)
         self.mute_box.toggled.connect(self._mute_changed)
         self.lang_combo.currentIndexChanged.connect(self._lang_changed)
+        self.tts_combo.currentIndexChanged.connect(self._tts_provider_changed)
         self.voice_combo.currentIndexChanged.connect(self._voice_changed)
         self.preview_voice_btn.clicked.connect(self.preview_voice)
         self.generate_btn.clicked.connect(self.generate_voices)
@@ -808,10 +817,54 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         dialog = SettingsDialog(self)
         if dialog.exec():
+            self._sync_tts_combo()
             self.reload_voices(background=True)
             self._set_status("Settings saved.")
 
+    def _voice_setting_key(self, provider: str) -> str:
+        if provider == "openai":
+            return "voice_openai"
+        if provider == "elevenlabs":
+            return "voice_elevenlabs"
+        return "voice_edge"
+
+    def _sync_tts_combo(self) -> None:
+        provider = self.settings().get("tts_provider", "edge-tts")
+        index = self.tts_combo.findData(provider)
+        self.tts_combo.blockSignals(True)
+        self.tts_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.tts_combo.blockSignals(False)
+
+    def _tts_provider_changed(self) -> None:
+        new = self.tts_combo.currentData()
+        if not new:
+            return
+        data = self.settings()
+        old = data.get("tts_provider", "edge-tts")
+        if new == old:
+            return
+        if new == "openai" and not (data.get("openai_api_key") or "").strip():
+            self._sync_tts_combo()
+            self._set_status("Add an OpenAI API key in Settings to use this voice.")
+            self.open_settings()
+            return
+        current_voice = self.voice_combo.currentData() or self.project.voice
+        if current_voice:
+            data[self._voice_setting_key(old)] = current_voice
+        remembered = data.get(self._voice_setting_key(new)) or (
+            "nova" if new == "openai" else "en-US-JennyNeural"
+        )
+        data["tts_provider"] = new
+        data["voice"] = remembered
+        save_settings(data)
+        self.project.voice = remembered
+        self.project.current().voice = remembered
+        self._clear_tts(self.project.lang)
+        self.reload_voices(background=True)
+        self.refresh_warnings()
+
     def reload_voices(self, background: bool = False) -> None:
+        self._sync_tts_combo()
         data = self.settings()
         provider = data.get("tts_provider", "edge-tts")
         key = data.get("elevenlabs_api_key", "") if provider == "elevenlabs" else ""
@@ -894,6 +947,8 @@ class MainWindow(QMainWindow):
         data = self.settings()
         data["voice"] = self.project.voice
         data["lang"] = self.project.lang
+        provider = data.get("tts_provider", "edge-tts")
+        data[self._voice_setting_key(provider)] = self.project.voice
         save_settings(data)
 
     def current_clip_index(self) -> int:

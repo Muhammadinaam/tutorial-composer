@@ -22,7 +22,7 @@ class SettingsDialog(QDialog):
 
         self.provider = QComboBox()
         self.provider.addItem("edge-tts (free, no key)", "edge-tts")
-        self.provider.addItem("OpenAI", "openai")
+        self.provider.addItem("OpenAI (gpt-4o-mini-tts)", "openai")
         self.provider.addItem("ElevenLabs", "elevenlabs")
         index = self.provider.findData(data.get("tts_provider", "edge-tts"))
         if index >= 0:
@@ -42,9 +42,11 @@ class SettingsDialog(QDialog):
         form.addRow("ElevenLabs API key", self.eleven_key)
 
         hint = QLabel(
-            "Keys stay on this computer only. The app works without keys "
-            "using edge-tts. OpenAI is also used to auto-translate the script "
-            "and to write narration from the video."
+            "Keys stay on this computer only. The script panel switches Edge and "
+            "OpenAI without reopening Settings. Edge is free for drafts. OpenAI "
+            "speaks with gpt-4o-mini-tts, and a line that was already generated "
+            "with the same voice is reused. OpenAI is also used to auto-translate "
+            "the script and to write narration from the video."
         )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
