@@ -30,6 +30,7 @@ class PreviewCanvas(QWidget):
         self._selected_id = ""
         self._playhead = 0.0
         self._draw_mode = False
+        self._draw_kind = "blur"
         self._drag: dict | None = None
 
     @property
@@ -67,8 +68,10 @@ class PreviewCanvas(QWidget):
         self._image = image
         self.update()
 
-    def set_draw_mode(self, enabled: bool) -> None:
+    def set_draw_mode(self, enabled: bool, kind: str = "blur") -> None:
         self._draw_mode = bool(enabled)
+        if enabled:
+            self._draw_kind = "highlight" if kind == "highlight" else "blur"
         if self._drag is None:
             self.setCursor(Qt.CursorShape.CrossCursor if self._draw_mode else Qt.CursorShape.ArrowCursor)
         self.update()
@@ -163,7 +166,7 @@ class PreviewCanvas(QWidget):
         if self._image is not None and not self._image.isNull() and content.width() > 1:
             painter.drawImage(content, self._image)
             for blur in self._regions:
-                if self._covers(blur):
+                if self._covers(blur) and not blur.is_highlight():
                     self._paint_blur(painter, blur)
         elif self._placeholder:
             painter.setPen(QColor("#8b9098"))
@@ -174,9 +177,13 @@ class PreviewCanvas(QWidget):
             if not selected and not self._covers(blur):
                 continue
             rect = self._widget_rect(blur)
+            highlight = blur.is_highlight()
             if selected and not self._covers(blur):
-                painter.fillRect(rect, QColor(160, 90, 220, 40))
-            pen = QPen(QColor("#ffffff") if selected else QColor("#d2b4ff"), 2 if selected else 1)
+                painter.fillRect(rect, QColor(255, 59, 48, 40) if highlight else QColor(160, 90, 220, 40))
+            if highlight:
+                pen = QPen(QColor("#ffffff") if selected else QColor("#ff3b30"), 4)
+            else:
+                pen = QPen(QColor("#ffffff") if selected else QColor("#d2b4ff"), 2 if selected else 1)
             if selected and not self._covers(blur):
                 pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
@@ -201,8 +208,12 @@ class PreviewCanvas(QWidget):
                     id="draft",
                 )
             )
-            painter.fillRect(rect, QColor(160, 90, 220, 70))
-            painter.setPen(QPen(QColor("#ffffff"), 1, Qt.PenStyle.DashLine))
+            if self._draw_kind == "highlight":
+                painter.fillRect(rect, QColor(255, 59, 48, 40))
+                painter.setPen(QPen(QColor("#ff3b30"), 3, Qt.PenStyle.DashLine))
+            else:
+                painter.fillRect(rect, QColor(160, 90, 220, 70))
+                painter.setPen(QPen(QColor("#ffffff"), 1, Qt.PenStyle.DashLine))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(rect.adjusted(0, 0, -1, -1))
 

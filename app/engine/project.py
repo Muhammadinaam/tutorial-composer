@@ -42,6 +42,10 @@ class Clip:
     def is_image(self) -> bool:
         return self.kind == "image"
 
+    @property
+    def is_pause(self) -> bool:
+        return self.kind == "pause"
+
 
 @dataclass
 class Cue:
@@ -56,6 +60,30 @@ class Cue:
             text=str(data.get("text", "")),
             should_video_stop=bool(data.get("should_video_stop", False)),
         )
+
+
+@dataclass
+class Pause:
+    at: float
+    duration: float = 1.5
+    id: str = field(default_factory=new_id)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Pause:
+        pause = cls(
+            at=float(data.get("at", 0.0)),
+            duration=float(data.get("duration", 1.5)),
+            id=str(data.get("id") or new_id()),
+        )
+        pause.clamp()
+        return pause
+
+    def clamp(self) -> None:
+        self.at = max(0.0, float(self.at))
+        self.duration = max(0.2, min(30.0, float(self.duration)))
 
 
 def clamp_speed(value: float) -> float:
@@ -77,12 +105,19 @@ class BlurRegion:
     w: float
     h: float
     id: str = field(default_factory=new_id)
+    kind: str = "blur"
+
+    def is_highlight(self) -> bool:
+        return self.kind == "highlight"
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> BlurRegion:
+        kind = str(data.get("kind") or "blur")
+        if kind not in {"blur", "highlight"}:
+            kind = "blur"
         region = cls(
             start=float(data.get("start", 0.0)),
             end=float(data.get("end", 0.0)),
@@ -91,6 +126,7 @@ class BlurRegion:
             w=float(data.get("w", 0.2)),
             h=float(data.get("h", 0.2)),
             id=str(data.get("id") or new_id()),
+            kind=kind,
         )
         region.clamp()
         return region
@@ -143,6 +179,8 @@ class Project:
     mark_in: float | None = None
     mark_out: float | None = None
     blurs: list[BlurRegion] = field(default_factory=list)
+    pauses: list[Pause] = field(default_factory=list)
+    burn_subtitles: bool = True
     speed: float = 1.0
     path: str | None = None
 
@@ -182,6 +220,8 @@ class Project:
             "mark_in": self.mark_in,
             "mark_out": self.mark_out,
             "blurs": [blur.to_dict() for blur in self.blurs],
+            "pauses": [pause.to_dict() for pause in self.pauses],
+            "burn_subtitles": self.burn_subtitles,
             "speed": clamp_speed(self.speed),
         }
 
@@ -214,6 +254,15 @@ class Project:
         for raw in data.get("blurs") or []:
             if isinstance(raw, dict):
                 blurs.append(BlurRegion.from_dict(raw))
+        legacy_pauses = []
+        for raw in data.get("pauses") or []:
+            if isinstance(raw, dict):
+                legacy_pauses.append(Pause.from_dict(raw))
+        if legacy_pauses and clips:
+            from app.engine.edl import insert_pause
+
+            for old in sorted(legacy_pauses, key=lambda item: -float(item.at)):
+                clips = insert_pause(clips, old.at, old.duration)
         return cls(
             clips=clips,
             mute_original=bool(data.get("mute_original", True)),
@@ -229,6 +278,8 @@ class Project:
             mark_in=data.get("mark_in"),
             mark_out=data.get("mark_out"),
             blurs=blurs,
+            pauses=[],
+            burn_subtitles=bool(data.get("burn_subtitles", True)),
             speed=clamp_speed(data.get("speed", 1.0)),
             path=path,
         )
@@ -337,6 +388,9 @@ def collect_media(project: Project, root: str | Path) -> list[str]:
     music_path = project.music_path
     try:
         for clip in project.clips:
+            if clip.is_pause:
+                clip.path = ""
+                continue
             clip.path = _store_media(clip.path, media, placed, missing, created)
         if project.music_path:
             project.music_path = _store_media(project.music_path, media, placed, missing, created)
@@ -427,7 +481,7 @@ def save_project(project: Project, path: str | Path | None = None) -> tuple[Path
     missing = collect_media(project, root)
     payload = project.to_dict()
     for raw, clip in zip(payload["clips"], project.clips):
-        raw["path"] = _relative_media_path(clip.path, root)
+        raw["path"] = "" if clip.is_pause else _relative_media_path(clip.path, root)
     if payload.get("music_path"):
         payload["music_path"] = _relative_media_path(str(payload["music_path"]), root)
     try:

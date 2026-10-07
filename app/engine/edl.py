@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from app.engine.ffmpeg import media_info
-from app.engine.project import IMAGE_EXTS, BlurRegion, Clip, Cue, new_id
+from app.engine.project import IMAGE_EXTS, BlurRegion, Clip, Cue, Pause, new_id
 
 DEFAULT_IMAGE_SECONDS = 5.0
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".wma"}
@@ -71,6 +71,42 @@ def map_joined_to_clip(clips: list[Clip], joined_time: float) -> tuple[Clip, flo
 
 def clip_joined_start(clips: list[Clip], index: int) -> float:
     return sum(c.used for c in clips[:index])
+
+
+def make_pause(duration: float = 1.5) -> Clip:
+    seconds = max(0.2, min(30.0, float(duration)))
+    return Clip(path="", in_point=0.0, out_point=seconds, duration=seconds, kind="pause")
+
+
+def insert_pause(clips: list[Clip], at: float, duration: float = 1.5) -> list[Clip]:
+    """Split the clip under ``at`` and place a freeze between the two pieces.
+
+    Narration times are left alone. Only the picture track grows.
+    """
+    if not clips:
+        return clips
+    total = joined_duration(clips)
+    at = min(max(0.0, float(at)), total)
+    mapped = map_joined_to_clip(clips, at)
+    if mapped is None:
+        return clips
+    clip, _local, index = mapped
+    if clip.is_pause:
+        clip.out_point = max(0.2, clip.out_point + float(duration))
+        clip.duration = clip.out_point
+        clip.in_point = 0.0
+        return clips
+    pause = make_pause(duration)
+    start = clip_joined_start(clips, index)
+    into = at - start
+    if into <= 0.05:
+        return clips[:index] + [pause] + clips[index:]
+    if into >= clip.used - 0.05:
+        return clips[: index + 1] + [pause] + clips[index + 1 :]
+    pieces = split_clip(clips, index, clip.in_point + into)
+    if len(pieces) == len(clips):
+        return clips[: index + 1] + [pause] + clips[index + 1 :]
+    return pieces[: index + 1] + [pause] + pieces[index + 1 :]
 
 
 def split_clip(clips: list[Clip], index: int, at_local_time: float) -> list[Clip]:
@@ -144,6 +180,19 @@ def remap_cues(old_clips: list[Clip], new_clips: list[Clip], cues: list[Cue]) ->
     return moved
 
 
+def remap_pauses(old_clips: list[Clip], new_clips: list[Clip], pauses: list[Pause]) -> list[Pause]:
+    total = joined_duration(new_clips)
+    moved: list[Pause] = []
+    for pause in pauses:
+        at = remap_joined_time(old_clips, new_clips, pause.at)
+        if total > 0:
+            at = min(at, total)
+        updated = replace(pause, at=at)
+        updated.clamp()
+        moved.append(updated)
+    return moved
+
+
 def remap_blurs(
     old_clips: list[Clip], new_clips: list[Clip], blurs: list[BlurRegion]
 ) -> list[BlurRegion]:
@@ -211,6 +260,22 @@ def ripple_cues(cues: list[Cue], start: float, end: float) -> list[Cue]:
     return result
 
 
+def ripple_pauses(pauses: list[Pause], start: float, end: float) -> list[Pause]:
+    lo, hi = (min(start, end), max(start, end))
+    gap = hi - lo
+    if gap < 0.05:
+        return list(pauses)
+    result: list[Pause] = []
+    for pause in pauses:
+        if pause.at >= hi - 0.001:
+            updated = replace(pause, at=max(0.0, pause.at - gap))
+            updated.clamp()
+            result.append(updated)
+        elif pause.at < lo + 0.001:
+            result.append(pause)
+    return result
+
+
 def ripple_blurs(blurs: list[BlurRegion], start: float, end: float) -> list[BlurRegion]:
     lo, hi = (min(start, end), max(start, end))
     gap = hi - lo
@@ -247,6 +312,12 @@ def ripple_blurs(blurs: list[BlurRegion], start: float, end: float) -> list[Blur
 
 
 def trim_clip(clip: Clip, new_in: float | None = None, new_out: float | None = None) -> None:
+    if clip.is_pause:
+        if new_out is not None:
+            clip.out_point = max(0.2, min(30.0, float(new_out)))
+            clip.in_point = 0.0
+            clip.duration = clip.out_point
+        return
     if new_in is not None:
         clip.in_point = max(0.0, min(new_in, clip.out_point - 0.08))
     if new_out is not None:
@@ -260,6 +331,8 @@ def trim_clip(clip: Clip, new_in: float | None = None, new_out: float | None = N
 
 def target_video_size(clips: list[Clip]) -> tuple[int, int, float]:
     for clip in clips:
+        if clip.is_pause or not clip.path:
+            continue
         try:
             info = media_info(clip.path)
         except Exception:

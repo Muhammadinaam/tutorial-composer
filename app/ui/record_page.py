@@ -79,8 +79,16 @@ class RecordPage(QWidget):
         camera_form.addRow("Size", size_row)
 
         self.mic_on = QCheckBox("Microphone")
+        self.mic_on.setToolTip(
+            "Record the PC microphone into the file as a reference. "
+            "Mute original audio on Compose when the AI voice should be the one people hear."
+        )
         self.mic_combo = QComboBox()
         self.system_on = QCheckBox("System audio")
+        self.system_on.setToolTip(
+            "Record speakers or a loopback device. It is mixed with the microphone, "
+            "so Mute original audio silences both."
+        )
         self.system_combo = QComboBox()
         self.audio_hint = QLabel()
         self.audio_hint.setObjectName("hintLabel")

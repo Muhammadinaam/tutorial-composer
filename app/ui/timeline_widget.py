@@ -5,7 +5,7 @@ from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen, QWheelEven
 from PySide6.QtWidgets import QScrollArea, QWidget
 
 from app.engine.edl import clip_joined_start, joined_duration, trim_clip
-from app.engine.project import BlurRegion, Clip
+from app.engine.project import BlurRegion, Clip, Pause
 from app.engine.script import format_timestamp
 
 
@@ -17,6 +17,8 @@ class TimelineCanvas(QWidget):
     musicSelected = Signal()
     blurSelected = Signal(str)
     blurEdited = Signal()
+    pauseSelected = Signal(str)
+    pauseEdited = Signal()
     editStarted = Signal()
     editFinished = Signal()
     clipReordered = Signal(str, int)
@@ -41,6 +43,8 @@ class TimelineCanvas(QWidget):
         self.mark_out = None
         self.blurs: list[BlurRegion] = []
         self.selected_blur = ""
+        self.pauses: list[Pause] = []
+        self.selected_pause = ""
         self.selected_cue = -1
         self._edit_open = False
         self.left_gutter = 40
@@ -64,6 +68,8 @@ class TimelineCanvas(QWidget):
         blurs: list[BlurRegion] | None = None,
         selected_blur: str = "",
         selected_cue: int = -1,
+        pauses: list[Pause] | None = None,
+        selected_pause: str = "",
     ) -> None:
         self.clips = clips
         self.selected = selected
@@ -78,6 +84,8 @@ class TimelineCanvas(QWidget):
         self.blurs = list(blurs or [])
         self.selected_blur = selected_blur or ""
         self.selected_cue = selected_cue
+        self.pauses = list(pauses or [])
+        self.selected_pause = selected_pause or ""
         self._refresh_size()
         self.update()
 
@@ -94,7 +102,10 @@ class TimelineCanvas(QWidget):
         last_cue = 0.0
         for start, length, *_rest in self.cue_spans:
             last_cue = max(last_cue, start + length)
-        return max(joined_duration(self.clips), last_cue, self.extra_end, 4.0)
+        pause_end = 0.0
+        for pause in self.pauses:
+            pause_end = max(pause_end, float(pause.at) + float(pause.duration))
+        return max(joined_duration(self.clips), last_cue, self.extra_end, pause_end, 4.0)
 
     def playhead_x(self) -> int:
         return self._time_to_x(self.playhead)
@@ -160,23 +171,39 @@ class TimelineCanvas(QWidget):
 
         for index, clip in enumerate(self.clips):
             rect = self._clip_rect(index)
-            selected = index == self.selected and not self.music_selected and not self.selected_blur
-            if clip.is_image:
+            selected = (
+                index == self.selected
+                and not self.music_selected
+                and not self.selected_blur
+                and not self.selected_pause
+            )
+            if clip.is_pause:
+                fill = QColor("#e0a000") if selected else QColor("#a87810")
+                title = "PAUSE"
+            elif clip.is_image:
                 fill = QColor("#c4922a") if selected else QColor("#8a6a2d")
+                title = f"IMG  {clip.name}"
             else:
                 fill = QColor("#3d8fd1") if selected else QColor("#2c5f8a")
-            self._draw_block(painter, rect, fill, selected, f"{'IMG' if clip.is_image else 'VID'}  {clip.name}", format_timestamp(clip.used))
+                title = f"VID  {clip.name}"
+            self._draw_block(painter, rect, fill, selected, title, format_timestamp(clip.used))
 
         for blur in self.blurs:
             rect = self._blur_bar_rect(blur)
             selected = blur.id == self.selected_blur
-            painter.setBrush(QColor(176, 112, 230, 210) if selected else QColor(120, 70, 180, 170))
-            painter.setPen(QPen(QColor("#ffffff") if selected else QColor("#2a1238"), 1))
+            if blur.is_highlight():
+                painter.setBrush(QColor(230, 70, 60, 220) if selected else QColor(180, 40, 36, 190))
+                painter.setPen(QPen(QColor("#ffffff") if selected else QColor("#3a1010"), 1))
+                label = "Box"
+            else:
+                painter.setBrush(QColor(176, 112, 230, 210) if selected else QColor(120, 70, 180, 170))
+                painter.setPen(QPen(QColor("#ffffff") if selected else QColor("#2a1238"), 1))
+                label = "Blur"
             painter.drawRoundedRect(rect, 3, 3)
             if rect.width() > 36:
                 painter.setPen(QColor("#ffffff"))
                 painter.setFont(QFont("Segoe UI", 7, QFont.Weight.DemiBold))
-                painter.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter, "Blur")
+                painter.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter, label)
 
         vo = self._track_rect(1)
         if not self.cue_spans:
@@ -238,6 +265,50 @@ class TimelineCanvas(QWidget):
         painter.setFont(QFont("Segoe UI", 7))
         painter.setPen(QColor("#e8e8e8"))
         painter.drawText(rect.adjusted(5, 14, -5, -2), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, subtitle)
+
+    def _pause_bar_rect(self, pause: Pause) -> QRect:
+        track = self._track_rect(0)
+        x = self._time_to_x(pause.at)
+        width = max(8, int(pause.duration * self.pps))
+        return QRect(x, track.y() + 1, width, 12)
+
+    def _hit_pause(self, pos) -> tuple[Pause, str] | None:
+        for pause in reversed(self.pauses):
+            rect = self._pause_bar_rect(pause)
+            if not rect.contains(pos):
+                continue
+            edge = 6 if rect.width() > 18 else 0
+            if edge and pos.x() >= rect.right() - edge:
+                return pause, "right"
+            return pause, "body"
+        return None
+
+    def _apply_pause_drag(self, time: float) -> None:
+        pause = next((item for item in self.pauses if item.id == self._drag["id"]), None)
+        if pause is None:
+            return
+        limit = joined_duration(self.clips)
+        origin = self._drag["time"]
+        start = float(self._drag["at"])
+        duration = float(self._drag["duration"])
+        if self._drag["mode"] == "pause-right":
+            pause.at = start
+            pause.duration = duration + (time - origin)
+        else:
+            pause.at = start + (time - origin)
+            pause.duration = duration
+        if limit > 0:
+            pause.at = min(pause.at, limit)
+        pause.clamp()
+        self._refresh_size()
+        self.update()
+        self.pauseEdited.emit()
+
+    def _clear_pause_selection(self) -> None:
+        if not self.selected_pause:
+            return
+        self.selected_pause = ""
+        self.pauseSelected.emit("")
 
     def _blur_bar_rect(self, blur: BlurRegion) -> QRect:
         track = self._track_rect(0)
@@ -322,7 +393,8 @@ class TimelineCanvas(QWidget):
             rect = self._clip_rect(index)
             if not rect.contains(pos):
                 continue
-            if pos.x() <= rect.left() + 8:
+            clip = self.clips[index]
+            if pos.x() <= rect.left() + 8 and not clip.is_pause:
                 return index, "left"
             if pos.x() >= rect.right() - 8:
                 return index, "right"
@@ -337,6 +409,29 @@ class TimelineCanvas(QWidget):
             return
         pos = event.position().toPoint()
         time = self._x_to_time(int(event.position().x()))
+        pause_hit = self._hit_pause(pos)
+        if pause_hit:
+            pause, zone = pause_hit
+            self.selected_pause = pause.id
+            self.selected_blur = ""
+            self.selected_cue = -1
+            self.music_selected = False
+            self.blurSelected.emit("")
+            self.pauseSelected.emit(pause.id)
+            self._open_edit()
+            self._drag = {
+                "mode": f"pause-{zone}",
+                "id": pause.id,
+                "at": pause.at,
+                "duration": pause.duration,
+                "time": time,
+            }
+            self.setCursor(
+                Qt.CursorShape.SizeHorCursor if zone == "right" else Qt.CursorShape.SizeAllCursor
+            )
+            self.update()
+            return
+        self._clear_pause_selection()
         blur_hit = self._hit_blur(pos)
         if blur_hit:
             blur, zone = blur_hit
@@ -377,7 +472,7 @@ class TimelineCanvas(QWidget):
                     "time": time,
                 }
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
-            else:
+            elif not clip.is_pause:
                 self._drag = {
                     "mode": "clip-pending",
                     "id": clip.id,
@@ -418,6 +513,9 @@ class TimelineCanvas(QWidget):
         x = pos.x()
         time = self._x_to_time(x)
         drag = self._drag
+        if drag and str(drag.get("mode", "")).startswith("pause"):
+            self._apply_pause_drag(time)
+            return
         if drag and str(drag.get("mode", "")).startswith("blur"):
             self._apply_blur_drag(time)
             return
@@ -434,6 +532,8 @@ class TimelineCanvas(QWidget):
             start = clip_joined_start(self.clips, index)
             if drag["mode"] == "left":
                 trim_clip(clip, new_in=drag["in"] + (time - drag["time"]))
+            elif clip.is_pause:
+                trim_clip(clip, new_out=max(0.2, time - start))
             else:
                 trim_clip(clip, new_out=max(0.1, time - start + clip.in_point))
             self._refresh_size()
@@ -471,6 +571,13 @@ class TimelineCanvas(QWidget):
                 self.update()
                 self.cueDragged.emit(index, new_time)
             return
+        pause_hit = self._hit_pause(pos)
+        if pause_hit:
+            zone = pause_hit[1]
+            self.setCursor(
+                Qt.CursorShape.SizeHorCursor if zone == "right" else Qt.CursorShape.SizeAllCursor
+            )
+            return
         blur_hit = self._hit_blur(pos)
         if blur_hit:
             zone = blur_hit[1]
@@ -489,12 +596,15 @@ class TimelineCanvas(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         was_playhead = bool(self._drag and self._drag.get("mode") == "playhead")
         was_blur = bool(self._drag and str(self._drag.get("mode", "")).startswith("blur"))
+        was_pause = bool(self._drag and str(self._drag.get("mode", "")).startswith("pause"))
         was_edit = self._edit_open
         self._drag = None
         self._edit_open = False
         self.setCursor(Qt.CursorShape.ArrowCursor)
         if was_blur:
             self.blurEdited.emit()
+        if was_pause:
+            self.pauseEdited.emit()
         if was_playhead:
             self.playheadReleased.emit(self.playhead)
         if was_edit:
@@ -509,6 +619,8 @@ class TimelineWidget(QScrollArea):
     musicSelected = Signal()
     blurSelected = Signal(str)
     blurEdited = Signal()
+    pauseSelected = Signal(str)
+    pauseEdited = Signal()
     editStarted = Signal()
     editFinished = Signal()
     clipReordered = Signal(str, int)
@@ -532,6 +644,8 @@ class TimelineWidget(QScrollArea):
         self.canvas.musicSelected.connect(self.musicSelected)
         self.canvas.blurSelected.connect(self.blurSelected)
         self.canvas.blurEdited.connect(self.blurEdited)
+        self.canvas.pauseSelected.connect(self.pauseSelected)
+        self.canvas.pauseEdited.connect(self.pauseEdited)
         self.canvas.editStarted.connect(self.editStarted)
         self.canvas.editFinished.connect(self.editFinished)
         self.canvas.clipReordered.connect(self.clipReordered)

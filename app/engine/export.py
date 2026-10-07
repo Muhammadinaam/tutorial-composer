@@ -43,24 +43,70 @@ def concat_clips(clips: list[Clip], dest: Path, mute: bool = True, on_progress=N
     filters: list[str] = []
     concat_v: list[str] = []
     concat_a: list[str] = []
+    input_of: dict[str, int] = {}
+    scale = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps:.3f},format=yuv420p"
+    )
+
+    def real_input(clip: Clip) -> int:
+        existing = input_of.get(clip.id)
+        if existing is not None:
+            return existing
+        slot = len(input_of)
+        input_of[clip.id] = slot
+        inputs.extend(["-i", clip.path])
+        return slot
+
+    def nearest_picture(start: int, step: int) -> tuple[Clip, int] | None:
+        index = start
+        while 0 <= index < len(clips):
+            candidate = clips[index]
+            if not candidate.is_pause and candidate.path:
+                return candidate, index
+            index += step
+        return None
 
     for index, clip in enumerate(clips):
-        inputs.extend(["-i", clip.path])
+        if clip.is_pause:
+            held = nearest_picture(index - 1, -1) or nearest_picture(index + 1, 1)
+            if held is None:
+                raise ValueError("A pause needs a video or image frame to hold.")
+            source, _source_index = held
+            slot = real_input(source)
+            duration = max(0.2, clip.used)
+            if source.is_image:
+                filters.append(
+                    f"[{slot}:v]loop=-1:size=1,trim=duration={duration:.3f},"
+                    f"setpts=PTS-STARTPTS,{scale}[v{index}]"
+                )
+            else:
+                end = max(0.04, float(source.out_point if held[1] < index else source.in_point + 0.04))
+                start = max(0.0, end - 0.04)
+                pad = max(0.0, duration - (end - start))
+                filters.append(
+                    f"[{slot}:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
+                    f"tpad=stop_mode=clone:stop_duration={pad:.3f},{scale}[v{index}]"
+                )
+            concat_v.append(f"[v{index}]")
+            if not mute:
+                filters.append(
+                    f"aevalsrc=0|0:s=44100:d={duration:.3f},aformat=channel_layouts=stereo[a{index}]"
+                )
+                concat_a.append(f"[a{index}]")
+            continue
+        slot = real_input(clip)
         start = max(0.0, clip.in_point)
         end = max(start + 0.04, clip.out_point)
         duration = max(0.04, end - start)
-        scale = (
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps:.3f},format=yuv420p"
-        )
         if clip.is_image:
             filters.append(
-                f"[{index}:v]loop=-1:size=1,trim=duration={duration:.3f},"
+                f"[{slot}:v]loop=-1:size=1,trim=duration={duration:.3f},"
                 f"setpts=PTS-STARTPTS,{scale}[v{index}]"
             )
         else:
             filters.append(
-                f"[{index}:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
+                f"[{slot}:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
                 f"{scale}[v{index}]"
             )
         concat_v.append(f"[v{index}]")
@@ -68,7 +114,7 @@ def concat_clips(clips: list[Clip], dest: Path, mute: bool = True, on_progress=N
             info = media_info(clip.path)
             if info["has_audio"] and not clip.is_image:
                 filters.append(
-                    f"[{index}:a]atrim=start={start:.3f}:end={end:.3f},"
+                    f"[{slot}:a]atrim=start={start:.3f}:end={end:.3f},"
                     f"asetpts=PTS-STARTPTS,aresample=44100,aformat=channel_layouts=stereo[a{index}]"
                 )
             else:
@@ -283,13 +329,19 @@ def blur_filter_script(blurs: list[BlurRegion], width: int, height: int, duratio
         chroma = max(1, min(luma, w // 4 - 1, h // 4 - 1))
         start = max(0.0, min(duration, float(blur.start)))
         end = max(start + 0.04, min(duration, float(blur.end)))
-        filters.append(f"[{current}]split=2[base{placed}][src{placed}]")
-        filters.append(
-            f"[src{placed}]crop={w}:{h}:{x}:{y},boxblur={luma}:1:{chroma}:1[blur{placed}]"
-        )
-        filters.append(
-            f"[base{placed}][blur{placed}]overlay={x}:{y}:enable='between(t\\,{start:.3f}\\,{end:.3f})'[v{placed}]"
-        )
+        if blur.is_highlight():
+            filters.append(
+                f"[{current}]drawbox=x={x}:y={y}:w={w}:h={h}:color=red:t=4:"
+                f"enable='between(t\\,{start:.3f}\\,{end:.3f})'[v{placed}]"
+            )
+        else:
+            filters.append(f"[{current}]split=2[base{placed}][src{placed}]")
+            filters.append(
+                f"[src{placed}]crop={w}:{h}:{x}:{y},boxblur={luma}:1:{chroma}:1[blur{placed}]"
+            )
+            filters.append(
+                f"[base{placed}][blur{placed}]overlay={x}:{y}:enable='between(t\\,{start:.3f}\\,{end:.3f})'[v{placed}]"
+            )
         current = f"v{placed}"
         placed += 1
     if not filters:
@@ -329,6 +381,88 @@ def apply_blurs(source: Path, blurs: list[BlurRegion], dest: Path, on_progress=N
         str(source),
         "-filter_complex",
         script_body.replace("\n", ""),
+        "-map",
+        "[vout]",
+    ]
+    if info["has_audio"]:
+        cmd.extend(["-map", "0:a", "-c:a", "aac", "-b:a", "192k"])
+    else:
+        cmd.append("-an")
+    cmd.extend(
+        [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            str(dest),
+            "-y",
+        ]
+    )
+    run(cmd, on_progress=on_progress, duration=duration)
+    return dest
+
+
+def srt_timestamp(seconds: float) -> str:
+    millis = int(round(max(0.0, float(seconds)) * 1000))
+    hours, millis = divmod(millis, 3_600_000)
+    minutes, millis = divmod(millis, 60_000)
+    secs, millis = divmod(millis, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def caption_entries(plan: TimelinePlan, rate: float = 1.0) -> list[tuple[float, float, str]]:
+    scale = clamp_speed(rate)
+    entries: list[tuple[float, float, str]] = []
+    for cue in plan.cues:
+        text = (cue.text or "").replace("\r", "").strip()
+        if not text:
+            continue
+        start = max(0.0, cue.output_time / scale)
+        end = max(start + 0.2, (cue.output_time + max(0.2, cue.tts_duration)) / scale)
+        entries.append((start, end, text))
+    return entries
+
+
+def format_srt(entries: list[tuple[float, float, str]]) -> str:
+    blocks = []
+    for index, (start, end, text) in enumerate(entries, start=1):
+        blocks.append(f"{index}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n{text}\n")
+    return "\n".join(blocks)
+
+
+def write_srt(path: str | Path, plan: TimelinePlan, rate: float = 1.0) -> Path:
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(format_srt(caption_entries(plan, rate)), encoding="utf-8")
+    return dest
+
+
+def _filter_path(path: Path) -> str:
+    text = path.resolve().as_posix()
+    return text.replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
+
+
+def apply_captions(source: Path, srt: Path, dest: Path, on_progress=None) -> Path:
+    info = media_info(source)
+    duration = max(float(info["duration"] or 0.0), 0.1)
+    style = (
+        "FontName=Arial\\,FontSize=22\\,PrimaryColour=&H00FFFFFF\\,"
+        "OutlineColour=&H00000000\\,BorderStyle=1\\,Outline=2\\,Shadow=0\\,Alignment=2"
+    )
+    filt = (
+        f"[0:v]subtitles=filename='{_filter_path(srt)}':charenc=UTF-8:"
+        f"force_style='{style}'[vout]"
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "-i",
+        str(source),
+        "-filter_complex",
+        filt,
         "-map",
         "[vout]",
     ]
@@ -545,8 +679,21 @@ def export_project(
         picture,
         plan.holds,
         held,
-        on_progress=hook("Inserting freeze frames", 0.44, 0.62),
+        on_progress=hook("Inserting freeze frames", 0.44, 0.58),
     )
+    picture = held
+    caption_srt = work / "captions.srt"
+    write_srt(caption_srt, plan, rate=1.0)
+    if getattr(project, "burn_subtitles", True) and caption_srt.read_text(encoding="utf-8").strip():
+        emit("Burning subtitles…", percent_start + span * 0.58)
+        captioned = work / "captioned.mp4"
+        apply_captions(
+            picture,
+            caption_srt,
+            captioned,
+            on_progress=hook("Burning subtitles", 0.58, 0.68),
+        )
+        picture = captioned
     items = [
         (cue.output_time, path)
         for cue, path in zip(plan.cues, tts_paths)
@@ -554,17 +701,17 @@ def export_project(
     ]
     rate = clamp_speed(getattr(project, "speed", 1.0))
     mix_dest = work / "mixed.mp4" if abs(rate - 1.0) >= 0.005 else dest
-    emit("Encoding final MP4…", percent_start + span * 0.62)
+    emit("Encoding final MP4…", percent_start + span * 0.68)
     mix_end = 0.86 if mix_dest != dest else 1.0
     mix_tts(
-        held,
+        picture,
         items,
         mix_dest,
         keep_original_audio=not project.mute_original,
         music_path=project.music_path,
         music_volume=project.music_volume,
         voice_volume=getattr(project, "voice_volume", 1.0),
-        on_progress=hook("Encoding final MP4", 0.62, mix_end),
+        on_progress=hook("Encoding final MP4", 0.68, mix_end),
     )
     if mix_dest != dest:
         emit("Applying speed…", percent_start + span * mix_end)
@@ -574,4 +721,5 @@ def export_project(
             rate,
             on_progress=hook("Applying speed", mix_end, 1.0),
         )
+    write_srt(dest.with_suffix(".srt"), plan, rate=rate)
     return dest

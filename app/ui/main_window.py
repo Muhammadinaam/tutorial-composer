@@ -44,13 +44,16 @@ from app.engine.edl import (
     joined_duration,
     map_joined_to_clip,
     probe_audio,
+    insert_pause,
     probe_clip,
     remap_blurs,
     remap_cues,
     remap_joined_time,
+    remap_pauses,
     reorder_clip,
     ripple_blurs,
     ripple_cues,
+    ripple_pauses,
     split_clip,
 )
 from app.engine.history import EditHistory
@@ -61,6 +64,7 @@ from app.engine.project import (
     BlurRegion,
     Cue,
     Narration,
+    Pause,
     Project,
     clamp_speed,
     is_project_bundle,
@@ -194,7 +198,13 @@ class MainWindow(QMainWindow):
         self._joining = False
         self._music_selected = False
         self._selected_blur_id = ""
+        self._selected_pause_id = ""
         self._selected_cue = -1
+        self._pause_holding = False
+        self._pause_hold_id = ""
+        self._pause_at = 0.0
+        self._pause_clock = 0.0
+        self._pauses_done: set[str] = set()
         self._cue_drag_cue: Cue | None = None
         self._reorder_dirty = False
         self._restoring = False
@@ -247,6 +257,9 @@ class MainWindow(QMainWindow):
         self._freeze_timer = QTimer(self)
         self._freeze_timer.setSingleShot(True)
         self._freeze_timer.timeout.connect(self._freeze_timeout)
+        self._pause_timer = QTimer(self)
+        self._pause_timer.setSingleShot(True)
+        self._pause_timer.timeout.connect(self._pause_hold_timeout)
 
         self._build_menu()
         self._build_ui()
@@ -351,7 +364,15 @@ class MainWindow(QMainWindow):
         self.time_label = QLabel("0:00 / 0:00")
         self.mute_box = QCheckBox("Mute original audio")
         self.mute_box.setChecked(True)
-        self.mute_box.setToolTip("Silence the recording's own sound while you preview.")
+        self.mute_box.setToolTip(
+            "Silence the recording, including the microphone reference, so the AI voice is what you hear. "
+            "The recording file still keeps that audio."
+        )
+        self.subs_box = QCheckBox("Burn subtitles")
+        self.subs_box.setChecked(True)
+        self.subs_box.setToolTip(
+            "Draw each spoken line on the exported video. A .srt file is always saved next to the MP4."
+        )
         controls.addWidget(self.play_btn)
         controls.addWidget(self.play_busy)
         controls.addWidget(self.time_label)
@@ -370,6 +391,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.speed_label)
         controls.addStretch()
         controls.addWidget(self.mute_box)
+        controls.addWidget(self.subs_box)
         preview_box.addLayout(controls)
         self.preview_hint = QLabel(
             "During Play, the picture waits until voice starts — a short delay is expected. Export keeps picture and voice in sync."
@@ -481,6 +503,16 @@ class MainWindow(QMainWindow):
         self.remove_music_btn = QPushButton("Remove music")
         self.split_btn = QPushButton("Split")
         self.split_btn.setToolTip("Cut the selected clip at the red playhead (S)")
+        self.pause_btn = QPushButton("Add pause")
+        self.pause_btn.setToolTip(
+            "Split the picture at the playhead and insert a frozen frame. V1 gets longer. "
+            "Narration stays where it is. Drag the pause's right edge to change its length."
+        )
+        self.highlight_btn = QPushButton("Highlight")
+        self.highlight_btn.setCheckable(True)
+        self.highlight_btn.setToolTip(
+            "Drag on the preview to draw a red box. Drag the red bar on V1 to choose when it shows."
+        )
         self.mark_in_btn = QPushButton("Mark In")
         self.mark_out_btn = QPushButton("Mark Out")
         self.blur_btn = QPushButton("Blur")
@@ -491,7 +523,9 @@ class MainWindow(QMainWindow):
         self.delete_range_btn = QPushButton("Delete In→Out")
         self.delete_range_btn.setToolTip("Ripple-delete the middle between yellow marks.")
         self.delete_btn = QPushButton("Delete")
-        self.delete_btn.setToolTip("Remove the selected narration line, blur, video, image, or music.")
+        self.delete_btn.setToolTip(
+            "Remove the selected narration line, pause, blur, highlight, video, image, or music."
+        )
         self.undo_btn = QPushButton("Undo")
         self.undo_btn.setToolTip("Undo the last edit (Ctrl+Z)")
         self.redo_btn = QPushButton("Redo")
@@ -502,9 +536,11 @@ class MainWindow(QMainWindow):
             self.add_music_btn,
             self.remove_music_btn,
             self.split_btn,
+            self.pause_btn,
             self.mark_in_btn,
             self.mark_out_btn,
             self.blur_btn,
+            self.highlight_btn,
             self.delete_range_btn,
             self.delete_btn,
             self.undo_btn,
@@ -555,6 +591,7 @@ class MainWindow(QMainWindow):
         self.timeline.setToolTip(
             "Drag a video to change its order. Drag a narration line to change when it starts. "
             "Click a block, then Delete to remove it. Drag the edges of a clip to trim. "
+            "A pause is a block on V1. Drag its right edge to change how long the picture holds. "
             "Drag the red line, or empty track, to scrub."
         )
         tl_box.addWidget(self.timeline)
@@ -607,9 +644,11 @@ class MainWindow(QMainWindow):
         self.undo_btn.clicked.connect(self.undo_edit)
         self.redo_btn.clicked.connect(self.redo_edit)
         self.split_btn.clicked.connect(self.split_at_playhead)
+        self.pause_btn.clicked.connect(self.add_pause_at_playhead)
         self.mark_in_btn.clicked.connect(self.mark_in)
         self.mark_out_btn.clicked.connect(self.mark_out)
-        self.blur_btn.toggled.connect(self._blur_tool_toggled)
+        self.blur_btn.toggled.connect(lambda on: self._region_tool_toggled("blur", on))
+        self.highlight_btn.toggled.connect(lambda on: self._region_tool_toggled("highlight", on))
         self.delete_range_btn.clicked.connect(self.delete_marked_range)
         self.preview.gestureStarted.connect(self._preview_gesture_started)
         self.preview.gestureFinished.connect(self._on_edit_finished)
@@ -618,6 +657,8 @@ class MainWindow(QMainWindow):
         self.preview.blurRectEdited.connect(self._blur_rect_edited)
         self.timeline.blurSelected.connect(self._on_blur_selected)
         self.timeline.blurEdited.connect(self._on_blur_edited)
+        self.timeline.pauseSelected.connect(self._on_pause_selected)
+        self.timeline.pauseEdited.connect(self._on_pause_edited)
         self.speed_slider.valueChanged.connect(self._speed_changed)
         self.add_cue_btn.clicked.connect(self.add_cue_at_playhead)
         self.remove_cue_btn.clicked.connect(self.remove_selected_cue)
@@ -632,6 +673,7 @@ class MainWindow(QMainWindow):
         self.music_volume.valueChanged.connect(self._music_volume_changed)
         self.timeline.musicSelected.connect(self._music_track_selected)
         self.mute_box.toggled.connect(self._mute_changed)
+        self.subs_box.toggled.connect(self._subs_changed)
         self.lang_combo.currentIndexChanged.connect(self._lang_changed)
         self.tts_combo.currentIndexChanged.connect(self._tts_provider_changed)
         self.voice_combo.currentIndexChanged.connect(self._voice_changed)
@@ -963,6 +1005,11 @@ class MainWindow(QMainWindow):
     def _spoken_cues(self) -> list[Cue]:
         return [c for c in self.project.current().cues if c.text.strip()]
 
+    def _make_plan(self, cues, durations, source: float | None = None):
+        if source is None:
+            source = joined_duration(self.project.clips)
+        return build_timeline(cues, durations, source)
+
     def _has_generated_voices(self) -> bool:
         cues = self._spoken_cues()
         return bool(
@@ -1025,6 +1072,7 @@ class MainWindow(QMainWindow):
             self._audio_hold = False
             self._waiting_for_voice = False
             self._discard_video_freeze()
+            self._discard_pause_hold()
 
     def _follow_changed(self, checked: bool) -> None:
         self.timeline.follow_playhead = checked
@@ -1066,6 +1114,7 @@ class MainWindow(QMainWindow):
 
     def refresh_all(self) -> None:
         self.mute_box.setChecked(self.project.mute_original)
+        self.subs_box.setChecked(self.project.burn_subtitles)
         self._apply_mute()
         self._rebuild_lang_tabs()
         self._load_cues_into_table()
@@ -1111,9 +1160,13 @@ class MainWindow(QMainWindow):
             selected_cue=self._selected_cue,
         )
         blur = self._selected_blur()
-        if blur:
+        clip = self.current_clip()
+        if clip and clip.is_pause and self._selected_blur_id == "" and self._selected_cue < 0 and not self._music_selected:
+            self.selected_label.setText(f"Pause {format_timestamp(clip.used)}")
+        elif blur:
+            word = "Highlight" if blur.is_highlight() else "Blur"
             self.selected_label.setText(
-                f"Blur {format_timestamp(blur.start)}–{format_timestamp(blur.end)}"
+                f"{word} {format_timestamp(blur.start)}–{format_timestamp(blur.end)}"
             )
         elif self._music_selected and self.project.music_path:
             self.selected_label.setText(f"Music: {Path(self.project.music_path).name}")
@@ -1123,8 +1176,13 @@ class MainWindow(QMainWindow):
         else:
             clip = self.current_clip()
             if clip:
-                kind = "Image" if clip.is_image else "Video"
-                self.selected_label.setText(f"{kind}: {clip.name}")
+                if clip.is_pause:
+                    kind = "Pause"
+                elif clip.is_image:
+                    kind = "Image"
+                else:
+                    kind = "Video"
+                self.selected_label.setText(f"{kind}: {clip.name}" if not clip.is_pause else f"Pause {format_timestamp(clip.used)}")
             else:
                 self.selected_label.setText("No clip selected")
 
@@ -1167,9 +1225,18 @@ class MainWindow(QMainWindow):
         self._apply_mute()
         self._set_status("Original audio muted." if checked else "Original audio on.")
 
+    def _subs_changed(self, checked: bool) -> None:
+        self.project.burn_subtitles = checked
+        self._set_status(
+            "Subtitles will be burned into the export."
+            if checked
+            else "Export will skip burned-in subtitles. The .srt file is still written."
+        )
+
     def _timeline_clip_selected(self, index: int) -> None:
         self._music_selected = False
         self._selected_blur_id = ""
+        self._selected_pause_id = ""
         self._selected_cue = -1
         self.selected_index = index
         self.refresh_timeline()
@@ -1177,6 +1244,7 @@ class MainWindow(QMainWindow):
     def _music_track_selected(self) -> None:
         self._music_selected = True
         self._selected_blur_id = ""
+        self._selected_pause_id = ""
         self._selected_cue = -1
         self.selected_index = -1
         if self.project.music_path:
@@ -1266,6 +1334,7 @@ class MainWindow(QMainWindow):
         self._audio_hold = False
         self._waiting_for_voice = False
         self._discard_video_freeze()
+        self._discard_pause_hold()
         restored = Project.from_dict(snap["project"], path=self.project.path)
         self.project = restored
         self.tts_store = {}
@@ -1277,6 +1346,7 @@ class MainWindow(QMainWindow):
         self._cue_drag_cue = None
         self._music_selected = False
         self._selected_blur_id = ""
+        self._selected_pause_id = ""
         self.selected_index = 0 if self.project.clips else -1
         self.playhead = min(self.playhead, joined_duration(self.project.clips))
         self.refresh_all()
@@ -1320,6 +1390,7 @@ class MainWindow(QMainWindow):
         for narration in self.project.narrations.values():
             narration.cues = remap_cues(old, new, narration.cues)
         self.project.blurs = remap_blurs(old, new, self.project.blurs)
+        self.project.pauses = remap_pauses(old, new, self.project.pauses)
         if self.project.mark_in is not None:
             self.project.mark_in = remap_joined_time(old, new, self.project.mark_in)
         if self.project.mark_out is not None:
@@ -1342,7 +1413,7 @@ class MainWindow(QMainWindow):
                     self.tts_durations = []
                     self.plan = None
                 continue
-            plan = build_timeline(spoken, list(durations), duration)
+            plan = self._make_plan(spoken, list(durations), duration)
             self.tts_store[lang] = (list(paths), list(durations), plan)
             if lang == self.project.lang:
                 self.tts_paths = list(paths)
@@ -1356,6 +1427,7 @@ class MainWindow(QMainWindow):
             return
         self._music_selected = False
         self._selected_blur_id = ""
+        self._selected_pause_id = ""
         self.selected_index = -1
         if 0 <= index < self.cue_table.rowCount():
             self.cue_table.setCurrentCell(index, 1)
@@ -1369,6 +1441,7 @@ class MainWindow(QMainWindow):
         self._selected_cue = row
         self._music_selected = False
         self._selected_blur_id = ""
+        self._selected_pause_id = ""
         self.selected_index = -1
         self.refresh_timeline()
 
@@ -1425,6 +1498,8 @@ class MainWindow(QMainWindow):
     def _seek_joined(self, seconds: float, keep_playing: bool = False, live: bool = False) -> None:
         total = joined_duration(self.project.clips)
         self.playhead = min(max(0.0, seconds), max(0.0, total))
+        self._discard_pause_hold()
+        self._remember_passed_pauses()
         mapped = map_joined_to_clip(self.project.clips, self.playhead)
         if mapped:
             _, _, index = mapped
@@ -1489,6 +1564,9 @@ class MainWindow(QMainWindow):
             self.player.pause()
             self.preview.show_image(clip.path, fallback=clip.name)
             return
+        if clip.is_pause:
+            self._show_paused_frame(index)
+            return
         url = QUrl.fromLocalFile(str(Path(clip.path).resolve()))
         source_changed = self.player.source() != url
         self.preview.show_video(clear=source_changed)
@@ -1505,6 +1583,38 @@ class MainWindow(QMainWindow):
         self._apply_playback_rate()
         if self._video_should_run() and not getattr(self, "_defer_video", False):
             self.player.play()
+
+    def _picture_near(self, index: int) -> tuple | None:
+        clips = self.project.clips
+        for step in (-1, 1):
+            cursor = index + step
+            while 0 <= cursor < len(clips):
+                clip = clips[cursor]
+                if not clip.is_pause and clip.path:
+                    moment = clip.out_point if step < 0 else clip.in_point
+                    return clip, moment
+                cursor += step
+        return None
+
+    def _show_paused_frame(self, index: int) -> None:
+        self.player.pause()
+        held = self._picture_near(index)
+        if held is None:
+            self.preview.show_placeholder("Pause")
+            return
+        source, moment = held
+        if source.is_image:
+            self.preview.show_image(source.path, fallback="Pause")
+            return
+        url = QUrl.fromLocalFile(str(Path(source.path).resolve()))
+        source_changed = self.player.source() != url
+        self.preview.show_video(clear=source_changed)
+        target_ms = int(max(0.0, moment) * 1000)
+        if source_changed:
+            self._begin_seek(target_ms, 250)
+            self.player.setSource(url)
+        self.player.setPosition(target_ms)
+        self.player.pause()
 
     def add_videos(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -1586,6 +1696,13 @@ class MainWindow(QMainWindow):
             self._set_status(f"Added {len(files)} clip(s) on V1.")
 
     def remove_clip(self) -> None:
+        if self._selected_pause_id:
+            self._begin_edit()
+            if not self._delete_selected_pause():
+                self._history.cancel()
+                return
+            self._commit_edit()
+            return
         if self._selected_blur_id:
             self._begin_edit()
             if not self._delete_selected_blur():
@@ -1621,6 +1738,9 @@ class MainWindow(QMainWindow):
         if not mapped:
             return
         clip, local, index = mapped
+        if clip.is_pause:
+            self._set_status("The playhead is already on a pause.")
+            return
         before = len(self.project.clips)
         self._begin_edit()
         self.project.clips = split_clip(self.project.clips, index, local)
@@ -1634,6 +1754,31 @@ class MainWindow(QMainWindow):
         self.refresh_warnings()
         self._commit_edit()
         self._set_status("Split. Select the piece you do not want and press Delete.")
+
+    def add_pause_at_playhead(self) -> None:
+        if not self.project.clips:
+            self._set_status("Add a video before inserting a pause.")
+            return
+        self._begin_edit()
+        before = joined_duration(self.project.clips)
+        self.project.clips = insert_pause(self.project.clips, self.playhead, 1.5)
+        after = joined_duration(self.project.clips)
+        mapped = map_joined_to_clip(self.project.clips, min(self.playhead, after))
+        if mapped and mapped[0].is_pause:
+            self.selected_index = mapped[2]
+        self._selected_blur_id = ""
+        self._selected_cue = -1
+        self._music_selected = False
+        self.refresh_timeline()
+        self.refresh_warnings()
+        self._refresh_transport()
+        self._show_current_media(force=True)
+        self._commit_edit()
+        grown = after - before
+        self._set_status(
+            f"Inserted a {grown:.1f}s pause on V1. Narration times stay where they are. "
+            "Drag the pause's right edge to change its length."
+        )
 
     def toggle_play(self) -> None:
         if not self.project.clips:
@@ -1730,6 +1875,9 @@ class MainWindow(QMainWindow):
         self._playing = True
         self._set_play_busy(False, "Pause")
         self._apply_mute()
+        if self._maybe_start_pause():
+            self._show_current_media(force=False)
+            return
         due = self._cue_index_at(self.playhead, lead=self.NARRATION_DUE_SLACK)
         if due is not None and self._cue_wants_stop(due):
             self._begin_video_freeze(due)
@@ -1738,6 +1886,7 @@ class MainWindow(QMainWindow):
         self._sync_music(force=True)
         if self._video_should_run():
             self._resume_transport()
+        self._start_clock_if_needed()
 
     def _pause_all(self) -> None:
         self._warmup_timer.stop()
@@ -1749,7 +1898,9 @@ class MainWindow(QMainWindow):
         self._sfx_play_when_ready = False
         self._joining = False
         self._discard_video_freeze()
+        self._discard_pause_hold()
         self._music_lead = 0.0
+        self._remember_passed_pauses()
         self._set_play_busy(False, "Play")
         self.player.pause()
         self._stop_sfx()
@@ -1759,13 +1910,19 @@ class MainWindow(QMainWindow):
 
     def _start_clock_if_needed(self) -> None:
         clip = self.current_clip()
-        if self._playing and clip and clip.is_image:
+        if self._playing and clip and (clip.is_image or clip.is_pause):
             self._image_clock.start()
         else:
             self._image_clock.stop()
 
     def _tick_image(self) -> None:
-        if not self._playing or self._audio_hold or self._waiting_for_voice or self._video_frozen:
+        if (
+            not self._playing
+            or self._audio_hold
+            or self._waiting_for_voice
+            or self._video_frozen
+            or self._pause_holding
+        ):
             return
         self.playhead += 0.033 * self._playback_rate()
         total = joined_duration(self.project.clips)
@@ -1790,10 +1947,11 @@ class MainWindow(QMainWindow):
             return
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self._joining = False
-            if self._audio_hold or self._waiting_for_voice:
+            clip = self.current_clip()
+            if self._audio_hold or self._waiting_for_voice or self._pause_holding or (clip and clip.is_pause):
                 self.player.pause()
             return
-        if self._audio_hold or self._waiting_for_voice or self._video_frozen or self._scrubbing or self._joining or self._seeking:
+        if self._audio_hold or self._waiting_for_voice or self._video_frozen or self._pause_holding or self._scrubbing or self._joining or self._seeking:
             return
         QTimer.singleShot(0, self._continue_playback)
 
@@ -1803,12 +1961,13 @@ class MainWindow(QMainWindow):
             and self._playing
             and not self._audio_hold
             and not self._video_frozen
+            and not self._pause_holding
             and not self._scrubbing
         ):
             QTimer.singleShot(0, self._play_next_clip)
 
     def _play_next_clip(self) -> None:
-        if not self._playing or self._audio_hold or self._video_frozen or self._scrubbing:
+        if not self._playing or self._audio_hold or self._video_frozen or self._pause_holding or self._scrubbing:
             return
         nxt = self.selected_index + 1
         if nxt >= len(self.project.clips):
@@ -1826,7 +1985,7 @@ class MainWindow(QMainWindow):
         self._sync_narration()
         self._sync_music()
         clip = self.current_clip()
-        if clip and not clip.is_image and self._video_should_run():
+        if clip and not clip.is_image and not clip.is_pause and self._video_should_run():
             self.player.play()
         QTimer.singleShot(80, self._clear_joining)
 
@@ -1834,19 +1993,22 @@ class MainWindow(QMainWindow):
         self._joining = False
         if self._playing and self._video_should_run():
             clip = self.current_clip()
-            if clip and not clip.is_image:
+            if clip and not clip.is_image and not clip.is_pause:
                 if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
                     self.player.play()
 
     def _continue_playback(self) -> None:
-        if not self._playing or self._audio_hold or self._waiting_for_voice or self._video_frozen or self._scrubbing or self._joining:
+        if not self._playing or self._audio_hold or self._waiting_for_voice or self._video_frozen or self._pause_holding or self._scrubbing or self._joining:
             return
         clip = self.current_clip()
         if not clip:
             self._pause_all()
             return
+        if clip.is_image or clip.is_pause:
+            self._start_clock_if_needed()
+            return
         local = self.player.position() / 1000.0
-        if not clip.is_image and local >= clip.out_point - 0.05:
+        if local >= clip.out_point - 0.05:
             self._play_next_clip()
             return
         if clip.is_image:
@@ -1855,7 +2017,7 @@ class MainWindow(QMainWindow):
         self.player.play()
 
     def _on_position(self, position: int) -> None:
-        if self._slider_dragging or self._scrubbing or self._audio_hold or self._waiting_for_voice or self._video_frozen or self._joining:
+        if self._slider_dragging or self._scrubbing or self._audio_hold or self._waiting_for_voice or self._video_frozen or self._pause_holding or self._joining:
             return
         if self._seeking:
             target = self._seek_target_ms
@@ -1866,7 +2028,7 @@ class MainWindow(QMainWindow):
         if not self.project.clips:
             return
         clip = self.current_clip()
-        if not clip or clip.is_image:
+        if not clip or clip.is_image or clip.is_pause:
             return
         local = position / 1000.0
         if local < clip.in_point - 0.05:
@@ -1891,11 +2053,13 @@ class MainWindow(QMainWindow):
         self._audio_hold = False
         self._waiting_for_voice = False
         self._discard_video_freeze()
+        self._discard_pause_hold()
         self._music_lead = 0.0
 
     def _slider_scrub(self, value: int) -> None:
         self._audio_hold = False
         self._discard_video_freeze()
+        self._discard_pause_hold()
         self._music_lead = 0.0
         self._scrubbing = True
         self._seek_joined(value / 1000.0, keep_playing=False, live=True)
@@ -1955,10 +2119,12 @@ class MainWindow(QMainWindow):
         self._audio_hold = False
         self._waiting_for_voice = False
         self._discard_video_freeze()
+        self._discard_pause_hold()
         self._music_lead = 0.0
         self._reset_narration_player()
         total = joined_duration(self.project.clips)
         self.playhead = min(max(0.0, seconds), max(0.0, total))
+        self._remember_passed_pauses()
         mapped = map_joined_to_clip(self.project.clips, self.playhead)
         if mapped:
             self.selected_index = mapped[2]
@@ -1975,12 +2141,16 @@ class MainWindow(QMainWindow):
             self.player.pause()
 
     def _video_should_run(self) -> bool:
+        clip = self.current_clip()
+        if clip and clip.is_pause:
+            return False
         return (
             self._playing
             and not self._scrubbing
             and not self._audio_hold
             and not self._waiting_for_voice
             and not self._video_frozen
+            and not self._pause_holding
         )
 
     def _cue_wants_stop(self, index: int) -> bool:
@@ -1993,6 +2163,85 @@ class MainWindow(QMainWindow):
         self._freeze_index = -1
         self._freeze_clock = 0.0
         self._freeze_timer.stop()
+
+    def _discard_pause_hold(self) -> None:
+        self._pause_holding = False
+        self._pause_hold_id = ""
+        self._pause_clock = 0.0
+        self._pause_timer.stop()
+
+    def _remember_passed_pauses(self) -> None:
+        self._pauses_done = {
+            pause.id
+            for pause in self.project.pauses
+            if float(pause.at) < self.playhead - 0.05
+        }
+
+    def _pause_media_elapsed(self) -> float:
+        if not self._pause_clock:
+            return 0.0
+        return max(0.0, monotonic() - self._pause_clock) * self._playback_rate()
+
+    def _maybe_start_pause(self) -> bool:
+        return False
+        if (
+            not self._playing
+            or self._pause_holding
+            or self._scrubbing
+            or self._video_frozen
+            or self._audio_hold
+            or self._waiting_for_voice
+            or self._joining
+        ):
+            return False
+        for pause in sorted(self.project.pauses, key=lambda item: (float(item.at), item.id)):
+            if pause.id in self._pauses_done:
+                continue
+            if self.playhead + 0.03 < float(pause.at):
+                return False
+            if self.playhead <= float(pause.at) + 0.45:
+                self._begin_pause_hold(pause)
+                return True
+            self._pauses_done.add(pause.id)
+        return False
+
+    def _begin_pause_hold(self, pause: Pause) -> None:
+        if self._pause_holding and self._pause_hold_id == pause.id:
+            return
+        self._pause_holding = True
+        self._pause_hold_id = pause.id
+        self._pause_at = float(pause.at)
+        self._pause_clock = monotonic()
+        self.playhead = self._pause_at
+        mapped = map_joined_to_clip(self.project.clips, self.playhead)
+        if mapped:
+            self.selected_index = mapped[2]
+        self.player.pause()
+        self._image_clock.stop()
+        self._refresh_transport()
+        self._sync_music()
+        self._pause_timer.start(int(max(0.2, float(pause.duration)) * 1000))
+
+    def _end_pause_hold(self, resume: bool = True) -> None:
+        if not self._pause_holding:
+            self._pause_timer.stop()
+            return
+        if self._pause_clock:
+            self._music_lead += self._pause_media_elapsed()
+        if self._pause_hold_id:
+            self._pauses_done.add(self._pause_hold_id)
+        at = self._pause_at
+        self._discard_pause_hold()
+        total = joined_duration(self.project.clips)
+        self.playhead = min(total, at + 0.03)
+        if resume and self._playing and not self._scrubbing and not self._audio_hold:
+            self._resume_transport()
+            self._sync_narration()
+            self._sync_music()
+
+    def _pause_hold_timeout(self) -> None:
+        if self._pause_holding:
+            self._end_pause_hold(resume=True)
 
     def _begin_video_freeze(self, index: int) -> None:
         if self._video_frozen and self._freeze_index == index:
@@ -2064,7 +2313,7 @@ class MainWindow(QMainWindow):
         self._waiting_for_voice = False
         if not self._playing:
             return
-        if self._video_frozen:
+        if self._video_frozen or self._pause_holding:
             self.player.pause()
             self._image_clock.stop()
             self._sync_music()
@@ -2163,7 +2412,9 @@ class MainWindow(QMainWindow):
             self._sfx_play_when_ready = True
 
     def _sync_narration(self, force: bool = False) -> None:
-        if self._warming:
+        if self._warming or self._pause_holding:
+            return
+        if self._playing and self._maybe_start_pause():
             return
         self._apply_voice_volume()
         if not self.plan or len(self.tts_paths) != len(self.plan.cues):
@@ -2229,8 +2480,10 @@ class MainWindow(QMainWindow):
         moment = self.playhead + self._music_lead
         if self._video_frozen and self._freeze_clock:
             moment += self._freeze_media_elapsed()
+        if self._pause_holding and self._pause_clock:
+            moment += self._pause_media_elapsed()
         offset = moment % length if length > 0.05 else moment
-        if self._video_frozen and not force:
+        if (self._video_frozen or self._pause_holding) and not force:
             self.music_audio.setVolume(self.project.music_volume)
             if self._playing:
                 self._ensure_playing(self.music_player)
@@ -2301,9 +2554,7 @@ class MainWindow(QMainWindow):
         cues = self._spoken_cues()
         if not cues or len(self.tts_durations) != len(cues):
             return
-        self.plan = build_timeline(
-            cues, self.tts_durations, joined_duration(self.project.clips)
-        )
+        self.plan = self._make_plan(cues, self.tts_durations)
         self._save_tts()
 
     def _table_changed(self, *_args) -> None:
@@ -2489,12 +2740,22 @@ class MainWindow(QMainWindow):
             return
         self.preview.set_regions(self.project.blurs, self._selected_blur_id, self.playhead)
 
-    def _blur_tool_toggled(self, on: bool) -> None:
-        self.preview.set_draw_mode(on)
-        if on:
-            self._set_status("Drag on the preview to blur part of the picture.")
+    def _region_tool_toggled(self, which: str, on: bool) -> None:
+        other = self.highlight_btn if which == "blur" else self.blur_btn
+        if on and other.isChecked():
+            other.blockSignals(True)
+            other.setChecked(False)
+            other.blockSignals(False)
+        drawing = self.blur_btn.isChecked() or self.highlight_btn.isChecked()
+        kind = "highlight" if self.highlight_btn.isChecked() else "blur"
+        self.preview.set_draw_mode(drawing, kind)
+        if not drawing:
+            self._set_status("Draw tool off.")
+            return
+        if kind == "highlight":
+            self._set_status("Drag on the preview to draw a red box.")
         else:
-            self._set_status("Blur tool off.")
+            self._set_status("Drag on the preview to blur part of the picture.")
 
     def _pause_for_blur_edit(self) -> None:
         if self._playing or self._warming:
@@ -2520,7 +2781,8 @@ class MainWindow(QMainWindow):
             else:
                 end = total
                 start = max(0.0, end - 0.08)
-        region = BlurRegion(start=start, end=end, x=x, y=y, w=w, h=h)
+        kind = "highlight" if self.highlight_btn.isChecked() else "blur"
+        region = BlurRegion(start=start, end=end, x=x, y=y, w=w, h=h, kind=kind)
         region.clamp()
         region.end = min(total, region.end)
         if region.end - region.start < 0.08:
@@ -2532,8 +2794,9 @@ class MainWindow(QMainWindow):
         else:
             self.refresh_timeline()
             self._sync_preview_overlays()
+        word = "Highlight" if region.is_highlight() else "Blur"
         self._set_status(
-            f"Blur from {format_timestamp(region.start)} to {format_timestamp(region.end)}. "
+            f"{word} from {format_timestamp(region.start)} to {format_timestamp(region.end)}. "
             "Drag its bar on V1 to change the time."
         )
 
@@ -2542,15 +2805,63 @@ class MainWindow(QMainWindow):
         if blur_id:
             self._music_selected = False
             self._selected_cue = -1
+            self._selected_pause_id = ""
         self.refresh_timeline()
         self._sync_preview_overlays()
+
+    def _selected_pause(self) -> Pause | None:
+        for pause in self.project.pauses:
+            if pause.id == self._selected_pause_id:
+                return pause
+        return None
+
+    def _refresh_plan(self) -> None:
+        cues = self._spoken_cues()
+        if cues and len(self.tts_durations) == len(cues):
+            self.plan = self._make_plan(cues, self.tts_durations)
+            self._save_tts()
+
+    def _on_pause_selected(self, pause_id: str) -> None:
+        self._selected_pause_id = pause_id or ""
+        if pause_id:
+            self._music_selected = False
+            self._selected_cue = -1
+            self._selected_blur_id = ""
+        self.refresh_timeline()
+
+    def _on_pause_edited(self) -> None:
+        self.project.pauses.sort(key=lambda item: (item.at, item.id))
+        self._refresh_plan()
+        pause = self._selected_pause()
+        if pause:
+            self.selected_label.setText(
+                f"Pause {format_timestamp(pause.at)} for {pause.duration:.1f}s"
+            )
+        self.refresh_warnings()
+
+    def _delete_selected_pause(self) -> bool:
+        pause_id = self._selected_pause_id
+        if not pause_id:
+            return False
+        before = len(self.project.pauses)
+        self.project.pauses = [pause for pause in self.project.pauses if pause.id != pause_id]
+        self._selected_pause_id = ""
+        self._pauses_done.discard(pause_id)
+        if len(self.project.pauses) == before:
+            return False
+        self._refresh_plan()
+        self.refresh_timeline()
+        self.refresh_warnings()
+        self._set_status("Pause removed.")
+        return True
 
     def _on_blur_edited(self) -> None:
         self._sync_preview_overlays()
         blur = self._selected_blur()
         if blur:
+            word = "Highlight" if blur.is_highlight() else "Blur"
             self.selected_label.setText(
-                f"Blur {format_timestamp(blur.start)}–{format_timestamp(blur.end)}"
+                f"{word} {format_timestamp(blur.start)}–{format_timestamp(blur.end)}"
             )
 
     def _blur_rect_edited(self, blur_id: str, x: float, y: float, w: float, h: float) -> None:
@@ -2565,6 +2876,8 @@ class MainWindow(QMainWindow):
         blur_id = self._selected_blur_id
         if not blur_id:
             return False
+        selected = self._selected_blur()
+        highlight = bool(selected and selected.is_highlight())
         before = len(self.project.blurs)
         self.project.blurs = [blur for blur in self.project.blurs if blur.id != blur_id]
         self._selected_blur_id = ""
@@ -2572,7 +2885,7 @@ class MainWindow(QMainWindow):
             return False
         self.refresh_timeline()
         self._sync_preview_overlays()
-        self._set_status("Blur removed.")
+        self._set_status("Highlight removed." if highlight else "Blur removed.")
         return True
 
     def mark_in(self) -> None:
@@ -2603,8 +2916,11 @@ class MainWindow(QMainWindow):
         for narration in self.project.narrations.values():
             narration.cues = ripple_cues(narration.cues, lo, hi)
         self.project.blurs = ripple_blurs(self.project.blurs, lo, hi)
+        self.project.pauses = ripple_pauses(self.project.pauses, lo, hi)
         if self._selected_blur_id and not self._selected_blur():
             self._selected_blur_id = ""
+        if self._selected_pause_id and not self._selected_pause():
+            self._selected_pause_id = ""
         self.project.sync_from_current()
         self.project.mark_in = None
         self.project.mark_out = None
@@ -2613,7 +2929,7 @@ class MainWindow(QMainWindow):
         self._load_cues_into_table()
         spoken = self._spoken_cues()
         if self.plan and len(self.tts_durations) == len(spoken) == len(self.plan.cues):
-            self.plan = build_timeline(spoken, self.tts_durations, joined_duration(self.project.clips))
+            self.plan = self._make_plan(spoken, self.tts_durations)
             self._save_tts()
         else:
             self._clear_tts(self.project.lang)
@@ -2639,7 +2955,7 @@ class MainWindow(QMainWindow):
             if len(self.tts_durations) == len(cues)
             else [estimate_speech_seconds(c.text) for c in cues]
         )
-        plan = build_timeline(cues, durations, source)
+        plan = self._make_plan(cues, durations, source)
         bits = []
         if late:
             bits.append(
@@ -2661,6 +2977,8 @@ class MainWindow(QMainWindow):
         elif not late and not stops:
             kind = "measured" if len(self.tts_durations) == len(cues) else "estimated"
             bits.append(f"No holds ({kind}). Speech fits the gaps.")
+        if any(clip.is_pause for clip in self.project.clips):
+            bits.append("Pauses hold the picture on V1. Spoken lines stay at their times.")
         if self.tts_paths and len(self.tts_paths) == len(cues):
             bits.append(f"{len(self.tts_paths)} voice clip(s) ready on the VO track.")
         self.warning_label.setText("\n".join(bits))
@@ -2736,7 +3054,7 @@ class MainWindow(QMainWindow):
                 )
                 paths.append(path)
                 durations.append(duration)
-            plan = build_timeline(cues, durations, source)
+            plan = self._make_plan(cues, durations, source)
             return paths, durations, plan
 
         self.generate_btn.setEnabled(False)
@@ -2913,7 +3231,7 @@ class MainWindow(QMainWindow):
                     paths.append(path)
                     durations.append(duration)
                 progress("Voices ready. Rendering video…", voice_end)
-            plan = build_timeline(cues, durations, source) if cues else build_timeline([], [], source)
+            plan = self._make_plan(cues, durations, source) if cues else self._make_plan([], [], source)
             progress("Rendering video with FFmpeg...", voice_end)
             export_project(
                 self.project,
@@ -2937,8 +3255,9 @@ class MainWindow(QMainWindow):
         self.export_btn.setEnabled(True)
         self._hide_export_progress()
         self.refresh_warnings()
+        srt = str(Path(dest).with_suffix(".srt"))
         self._set_status(f"Exported {dest}")
-        QMessageBox.information(self, "Export complete", f"Saved:\n{dest}")
+        QMessageBox.information(self, "Export complete", f"Saved:\n{dest}\n{srt}")
 
     def new_project(self) -> None:
         self.project = Project(
@@ -2953,7 +3272,9 @@ class MainWindow(QMainWindow):
         self.selected_index = -1
         self._music_selected = False
         self._selected_blur_id = ""
+        self._selected_pause_id = ""
         self.blur_btn.setChecked(False)
+        self.highlight_btn.setChecked(False)
         self._pause_all()
         self.player.stop()
         self.music_player.stop()
@@ -2978,7 +3299,9 @@ class MainWindow(QMainWindow):
         self.selected_index = 0 if self.project.clips else -1
         self._music_selected = False
         self._selected_blur_id = ""
+        self._selected_pause_id = ""
         self.blur_btn.setChecked(False)
+        self.highlight_btn.setChecked(False)
         self.refresh_all()
         self._set_status(f"Opened {Path(path).name}")
 

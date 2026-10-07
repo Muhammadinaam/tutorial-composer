@@ -38,6 +38,7 @@ def build_timeline(
     cues: list[Cue],
     durations: list[float],
     source_duration: float,
+    pauses: list | None = None,
 ) -> TimelinePlan:
     if len(durations) != len(cues):
         raise ValueError("Each cue needs a speech duration.")
@@ -45,6 +46,8 @@ def build_timeline(
     holds: list[Hold] = []
     extra = 0.0
     source_duration = max(0.0, float(source_duration))
+    # Pauses are picture inserted on V1. They do not move or delay spoken lines.
+    del pauses
 
     for index, cue in enumerate(cues):
         next_time = (
