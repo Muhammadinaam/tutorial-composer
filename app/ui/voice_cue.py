@@ -42,11 +42,11 @@ class VoiceCuePlayer(QObject):
         )
 
     def isPlaying(self) -> bool:
-        return (
-            self._heard
-            and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-            and self._player.position() > 40
-        )
+        # Once speech has started, a brief position dip (play() seeks to 0)
+        # must still count as playing. Otherwise the timeline restarts the clip.
+        if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            return False
+        return self._heard or self._player.position() > 40
 
     def setPlaybackRate(self, rate: float) -> None:
         self._rate = max(0.25, min(2.0, float(rate)))

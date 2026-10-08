@@ -1540,7 +1540,7 @@ class MainWindow(QMainWindow):
             self._start_clock_if_needed()
             if self._playing:
                 clip = self.current_clip()
-                if clip and not clip.is_image:
+                if clip and not clip.is_image and not clip.is_pause and self._video_should_run():
                     self.player.play()
         elif not live and not self._playing:
             self.player.pause()
@@ -2090,18 +2090,18 @@ class MainWindow(QMainWindow):
     def _cue_index_at(self, moment: float, lead: float = 0.0) -> int | None:
         if not self.plan or len(self.tts_paths) != len(self.plan.cues):
             return None
-        # Cues stay "current" for their whole speech length, so a later line's
-        # start can still sit inside an earlier line's window. After a line
-        # finishes — especially a Stop-video line, whose playhead never moved —
-        # do not fall back to that earlier line or the playhead jumps to it.
+        # A long line's window can still cover a later line's start. The later
+        # line is the one that should play; falling back restarts the earlier clip.
+        # Finished lines stay skipped so a Stop-video hold cannot jump backward.
+        found = None
         for index, cue in enumerate(self.plan.cues):
             if index <= self._narration_finished:
                 continue
             start = cue.video_time
             end = start + max(0.05, cue.tts_duration)
             if start - lead <= moment < end:
-                return index
-        return None
+                found = index
+        return found
 
     def _ensure_playing(self, player: QMediaPlayer) -> None:
         if player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
@@ -2334,7 +2334,7 @@ class MainWindow(QMainWindow):
         self._show_current_media(force=False)
         self._start_clock_if_needed()
         clip = self.current_clip()
-        if clip and not clip.is_image:
+        if clip and not clip.is_image and not clip.is_pause and self._video_should_run():
             self.player.play()
         self._sync_music(force=True)
 
@@ -2442,7 +2442,13 @@ class MainWindow(QMainWindow):
         if upcoming == self._narration_finished:
             upcoming = None
         audible = self._voice_is_audible()
-        if not force and self._playing and due is not None and due == self._narration_index and audible:
+        if (
+            not force
+            and self._playing
+            and due is not None
+            and due == self._narration_index
+            and (audible or self._waiting_for_voice or self._sfx_play_when_ready)
+        ):
             return
         if due is None:
             if audible and not force and self._playing:
