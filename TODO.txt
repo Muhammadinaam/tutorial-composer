@@ -1,0 +1,1 @@
+listen our audio (we will specify lang) and generate text to be spoken automatically

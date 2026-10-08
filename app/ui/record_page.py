@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.engine.capture import guess_system_audio, list_dshow_devices
+from app.engine.loopback import SPEAKER_LOOPBACK, speaker_loopback_available
 from app.engine.settings import load_settings, save_settings
 from app.ui.camera_window import camera_devices
 
@@ -86,8 +87,8 @@ class RecordPage(QWidget):
         self.mic_combo = QComboBox()
         self.system_on = QCheckBox("System audio")
         self.system_on.setToolTip(
-            "Record speakers or a loopback device. It is mixed with the microphone, "
-            "so Mute original audio silences both."
+            "Record the default speakers, Stereo Mix, or a virtual cable. "
+            "It is mixed with the microphone, so Mute original audio silences both."
         )
         self.system_combo = QComboBox()
         self.audio_hint = QLabel()
@@ -169,28 +170,37 @@ class RecordPage(QWidget):
             for cam in cams:
                 self.camera_combo.addItem(cam.description(), cam.description())
 
-        videos, audios = list_dshow_devices()
+        videos, audios, listing_error = list_dshow_devices()
         self._audio_devices = audios
+        loopback_ok = speaker_loopback_available()
         self.mic_combo.clear()
         self.system_combo.clear()
         if not audios:
             self.mic_combo.addItem("No audio device found", "")
-            self.system_combo.addItem("No loopback device found", "")
             self.mic_on.setChecked(False)
-            self.system_on.setChecked(False)
-            self.audio_hint.setText("FFmpeg did not list DirectShow audio devices.")
+            if not loopback_ok:
+                self.system_combo.addItem("No loopback device found", "")
+                self.system_on.setChecked(False)
         else:
             for name in audios:
                 self.mic_combo.addItem(name, name)
                 self.system_combo.addItem(name, name)
-            loopback = guess_system_audio(audios)
-            if loopback:
-                self.audio_hint.setText(f"Suggested system audio: {loopback}")
-            else:
-                self.audio_hint.setText(
-                    "No Stereo Mix / loopback device was found. Enable Stereo Mix "
-                    "in Windows sound settings, or pick a virtual cable."
-                )
+        if loopback_ok:
+            self.system_combo.addItem("Default speakers (loopback)", SPEAKER_LOOPBACK)
+        guessed = guess_system_audio(audios)
+        if listing_error and not audios:
+            self.audio_hint.setText(listing_error)
+        elif guessed:
+            self.audio_hint.setText(f"Suggested system audio: {guessed}")
+        elif loopback_ok:
+            self.audio_hint.setText("System audio uses the default speakers.")
+        elif not audios:
+            self.audio_hint.setText("FFmpeg did not list DirectShow audio devices.")
+        else:
+            self.audio_hint.setText(
+                "No Stereo Mix / loopback device was found. Enable Stereo Mix "
+                "in Windows sound settings, or pick a virtual cable."
+            )
         self._filling = False
         _ = videos
 
@@ -216,6 +226,8 @@ class RecordPage(QWidget):
             guessed = guess_system_audio(self._audio_devices)
             if guessed:
                 saved_sys = guessed
+            elif self.system_combo.findData(SPEAKER_LOOPBACK) >= 0:
+                saved_sys = SPEAKER_LOOPBACK
         self._select_combo(self.system_combo, saved_sys)
         sys_on = bool(data.get("record_system_audio_enabled", False))
         if sys_on and not self.system_combo.currentData():

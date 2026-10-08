@@ -37,7 +37,75 @@ def _bundled_ffmpeg() -> str | None:
         return None
 
 
+def _ffmpeg_search_paths() -> list[str]:
+    ordered: list[str] = []
+
+    def add(path: str | None) -> None:
+        if not path:
+            return
+        resolved = str(Path(path))
+        if resolved not in ordered and Path(resolved).is_file():
+            ordered.append(resolved)
+
+    # The imageio build includes DirectShow. A ffmpeg earlier on PATH often
+    # does not, which is why one PC lists microphones and another does not.
+    if sys.platform == "win32":
+        add(_bundled_ffmpeg())
+    add(shutil.which("ffmpeg"))
+    exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    for folder in _project_tools():
+        add(str(folder / exe))
+    if sys.platform == "win32":
+        add(str(Path(r"C:\ffmpeg\bin") / exe))
+        add(
+            str(
+                Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+                / "ffmpeg"
+                / "bin"
+                / exe
+            )
+        )
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            add(str(Path(local) / "Microsoft" / "WinGet" / "Links" / exe))
+    if sys.platform != "win32":
+        add(_bundled_ffmpeg())
+    return ordered
+
+
+def ffmpeg_candidates() -> list[str]:
+    return _ffmpeg_search_paths()
+
+
+def _ffmpeg_formats(path: str) -> str:
+    try:
+        proc = subprocess.run(
+            [path, "-hide_banner", "-formats"],
+            capture_output=True,
+            **_hide_window_kwargs(),
+        )
+    except Exception:
+        return ""
+    return _decode_subprocess(proc.stdout or b"") + _decode_subprocess(proc.stderr or b"")
+
+
+def ffmpeg_has_dshow(path: str) -> bool:
+    return " dshow " in _ffmpeg_formats(path).lower()
+
+
+@lru_cache(maxsize=1)
+def _chosen_ffmpeg() -> str | None:
+    candidates = _ffmpeg_search_paths()
+    if sys.platform == "win32":
+        for path in candidates:
+            if ffmpeg_has_dshow(path):
+                return path
+    return candidates[0] if candidates else None
+
+
 def find_tool(name: str) -> str | None:
+    if name == "ffmpeg":
+        return _chosen_ffmpeg()
     found = shutil.which(name)
     if found:
         return found
@@ -58,10 +126,6 @@ def find_tool(name: str) -> str | None:
     for path in extra:
         if path.is_file():
             return str(path)
-    if name == "ffmpeg":
-        bundled = _bundled_ffmpeg()
-        if bundled and Path(bundled).is_file():
-            return bundled
     return None
 
 
@@ -72,6 +136,28 @@ def ffmpeg_path() -> str:
             "FFmpeg was not found. Install FFmpeg or keep imageio-ffmpeg installed."
         )
     return path
+
+
+def _decode_subprocess(data: bytes) -> str:
+    """Read FFmpeg output from a pipe.
+
+    Some Windows builds write the device list as UTF-16 when there is no
+    console. Decoding those bytes as UTF-8 drops every device name.
+    """
+    if not data:
+        return ""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace").replace("\x00", "")
+    sample = data[:400]
+    if sample.count(0) > max(4, len(sample) // 4):
+        encoding = "utf-16-le" if data[:2] != b"\xfe\xff" else "utf-16-be"
+        return data.decode(encoding, errors="replace").replace("\x00", "")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        if sys.platform == "win32":
+            return data.decode("mbcs", errors="replace")
+        return data.decode("utf-8", errors="replace")
 
 
 def ffprobe_path() -> str | None:

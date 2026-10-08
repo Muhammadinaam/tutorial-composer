@@ -4,7 +4,7 @@ import json
 import os
 import shutil
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 
@@ -140,26 +140,37 @@ class BlurRegion:
         self.end = max(self.start + 0.08, float(self.end))
 
 
+def clone_region(region: BlurRegion, *, keep_id: bool = False) -> BlurRegion:
+    return replace(region, id=region.id if keep_id else new_id())
+
+
 @dataclass
 class Narration:
     lang: str = "en"
     voice: str = "en-US-JennyNeural"
     cues: list[Cue] = field(default_factory=list)
+    highlights: list[BlurRegion] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
             "lang": self.lang,
             "voice": self.voice,
             "cues": [asdict(c) for c in self.cues],
+            "highlights": [item.to_dict() for item in self.highlights],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> Narration:
         cues = [Cue.from_dict(c) if isinstance(c, dict) else c for c in data.get("cues", [])]
+        highlights = []
+        for raw in data.get("highlights") or []:
+            if isinstance(raw, dict):
+                highlights.append(BlurRegion.from_dict(raw))
         return cls(
             lang=data.get("lang", "en"),
             voice=data.get("voice", "en-US-JennyNeural"),
             cues=cues,
+            highlights=highlights,
         )
 
 
@@ -196,6 +207,10 @@ class Project:
         if self.lang not in self.narrations:
             self.narrations[self.lang] = Narration(lang=self.lang, voice=self.voice)
         return self.narrations[self.lang]
+
+    def regions(self) -> list[BlurRegion]:
+        """Shared blurs plus the highlight boxes for the current language."""
+        return [*self.blurs, *self.current().highlights]
 
     def sync_from_current(self) -> None:
         current = self.current()
@@ -251,9 +266,22 @@ class Project:
         elif lang in narrations and not narrations[lang].cues and cues:
             narrations[lang].cues = list(cues)
         blurs = []
+        legacy_highlights = []
         for raw in data.get("blurs") or []:
-            if isinstance(raw, dict):
-                blurs.append(BlurRegion.from_dict(raw))
+            if not isinstance(raw, dict):
+                continue
+            region = BlurRegion.from_dict(raw)
+            if region.is_highlight():
+                legacy_highlights.append(region)
+            else:
+                blurs.append(region)
+        if legacy_highlights and narrations and not any(item.highlights for item in narrations.values()):
+            owner = narrations.get(lang) or next(iter(narrations.values()))
+            owner.highlights = legacy_highlights
+            for narration in narrations.values():
+                if narration is owner:
+                    continue
+                narration.highlights = [clone_region(item) for item in legacy_highlights]
         legacy_pauses = []
         for raw in data.get("pauses") or []:
             if isinstance(raw, dict):

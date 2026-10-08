@@ -3,11 +3,20 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 
-from app.engine.ffmpeg import ffmpeg_path, start_process, stop_process
+from app.engine.ffmpeg import (
+    _decode_subprocess,
+    ffmpeg_candidates,
+    ffmpeg_path,
+    media_info,
+    run,
+    start_process,
+    stop_process,
+)
+from app.engine.loopback import LoopbackRecorder, is_speaker_loopback
 from app.engine.settings import recordings_dir
 
 
@@ -71,13 +80,48 @@ def has_ddagrab() -> bool:
         return False
 
 
-def list_dshow_devices() -> tuple[list[str], list[str]]:
+_DSHOW_QUOTED = re.compile(r'"([^"]+)"(.*)$')
+
+
+def list_dshow_devices() -> tuple[list[str], list[str], str]:
+    """Return video names, audio names, and an error string.
+
+    An empty error means a DirectShow listing ran. FFmpeg 7 prints
+    ``"Name" (audio)`` on one line. Older builds print a section header,
+    then the quoted name. Some Windows builds write that list as UTF-16.
+    """
     if sys.platform != "win32":
-        return [], []
+        return [], [], ""
+    try:
+        primary = ffmpeg_path()
+    except Exception as exc:
+        return [], [], str(exc)
+    paths: list[str] = []
+    for path in (primary, *ffmpeg_candidates()):
+        if path not in paths:
+            paths.append(path)
+    errors: list[str] = []
+    ran = False
+    for path in paths:
+        videos, audios, error, ok = _list_dshow_from(path)
+        if videos or audios:
+            return videos, audios, ""
+        if ok:
+            ran = True
+        elif error:
+            errors.append(error)
+    if ran:
+        return [], [], ""
+    if errors:
+        return [], [], errors[0]
+    return [], [], "FFmpeg did not list DirectShow devices."
+
+
+def _list_dshow_from(path: str) -> tuple[list[str], list[str], str, bool]:
     try:
         proc = subprocess.run(
             [
-                ffmpeg_path(),
+                path,
                 "-hide_banner",
                 "-list_devices",
                 "true",
@@ -87,14 +131,26 @@ def list_dshow_devices() -> tuple[list[str], list[str]]:
                 "dummy",
             ],
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             **_hide_window_kwargs(),
         )
-    except Exception:
-        return [], []
-    text = proc.stderr or proc.stdout or ""
+    except Exception as exc:
+        return [], [], str(exc), False
+    text = _decode_subprocess(proc.stderr or b"")
+    if proc.stdout:
+        text = f"{text}\n{_decode_subprocess(proc.stdout)}"
+    videos, audios = _parse_dshow_listing(text)
+    if videos or audios:
+        return videos, audios, "", True
+    low = text.lower()
+    if "unknown input format" in low or "not recognized" in low or "no such filter" in low:
+        detail = " ".join(text.split())
+        return [], [], (detail[-500:] if detail else "FFmpeg could not list DirectShow devices."), False
+    if not text.strip():
+        return [], [], "FFmpeg did not list DirectShow devices.", False
+    return [], [], "", True
+
+
+def _parse_dshow_listing(text: str) -> tuple[list[str], list[str]]:
     videos: list[str] = []
     audios: list[str] = []
     section = ""
@@ -108,17 +164,38 @@ def list_dshow_devices() -> tuple[list[str], list[str]]:
             continue
         if "alternative name" in low:
             continue
-        match = re.search(r'"([^"]+)"', line)
-        if not match or not section:
+        match = _DSHOW_QUOTED.search(line)
+        if not match:
             continue
-        name = match.group(1).strip()
-        if not name:
-            continue
-        if section == "video" and name not in videos:
-            videos.append(name)
-        elif section == "audio" and name not in audios:
-            audios.append(name)
+        name, suffix = match.group(1), match.group(2)
+        kinds = _media_kinds(suffix)
+        if not kinds and section:
+            kinds = [section]
+        for kind in kinds:
+            _append_device(videos, audios, name, kind)
     return videos, audios
+
+
+def _media_kinds(suffix: str) -> list[str]:
+    kinds: list[str] = []
+    for blob in re.findall(r"\(([^)]*)\)", suffix):
+        low = blob.lower()
+        for kind in ("video", "audio"):
+            if re.search(rf"\b{kind}\b", low) and kind not in kinds:
+                kinds.append(kind)
+        if "none" in low and not kinds:
+            kinds.append("none")
+    return kinds
+
+
+def _append_device(videos: list[str], audios: list[str], name: str, kind: str) -> None:
+    cleaned = name.strip()
+    if not cleaned or kind == "none":
+        return
+    if kind == "video" and cleaned not in videos:
+        videos.append(cleaned)
+    elif kind == "audio" and cleaned not in audios:
+        audios.append(cleaned)
 
 
 def guess_system_audio(audio_devices: list[str]) -> str | None:
@@ -182,13 +259,19 @@ def _quote_dshow(name: str) -> str:
     return f"audio={cleaned}"
 
 
+def _dshow_request(request: CaptureRequest) -> CaptureRequest:
+    if is_speaker_loopback(request.system_audio):
+        return replace(request, system_audio=None)
+    return request
+
+
 def _audio_inputs(mic: str | None, system_audio: str | None) -> tuple[list[str], int]:
     args: list[str] = []
     count = 0
-    if mic:
+    if mic and not is_speaker_loopback(mic):
         args.extend(["-f", "dshow", "-i", _quote_dshow(mic)])
         count += 1
-    if system_audio and system_audio != mic:
+    if system_audio and system_audio != mic and not is_speaker_loopback(system_audio):
         args.extend(["-f", "dshow", "-i", _quote_dshow(system_audio)])
         count += 1
     return args, count
@@ -242,6 +325,7 @@ class ScreenRecorder:
         self.process: subprocess.Popen | None = None
         self.request: CaptureRequest | None = None
         self._used_ddagrab = False
+        self._loopback: LoopbackRecorder | None = None
 
     @property
     def running(self) -> bool:
@@ -256,8 +340,21 @@ class ScreenRecorder:
         self.request = request
         use_dda = has_ddagrab()
         self._used_ddagrab = use_dda
-        args = _build_args(request, use_ddagrab=use_dda)
-        self.process = start_process(args)
+        if is_speaker_loopback(request.system_audio):
+            self._loopback = LoopbackRecorder(request.dest.with_suffix(".loopback.wav"))
+            try:
+                self._loopback.start()
+            except Exception:
+                self._loopback = None
+                self.request = None
+                raise
+        try:
+            args = _build_args(_dshow_request(request), use_ddagrab=use_dda)
+            self.process = start_process(args)
+        except Exception:
+            self._cancel_loopback()
+            self.request = None
+            raise
 
     def try_gdigrab_fallback(self) -> bool:
         if not self.process or not self.request or not self._used_ddagrab:
@@ -265,7 +362,7 @@ class ScreenRecorder:
         if self.process.poll() is None:
             return False
         self._used_ddagrab = False
-        args = _build_args(self.request, use_ddagrab=False)
+        args = _build_args(_dshow_request(self.request), use_ddagrab=False)
         self.process = start_process(args)
         return True
 
@@ -274,6 +371,7 @@ class ScreenRecorder:
             return None
         stderr = stop_process(self.process, timeout=2)
         self.process = None
+        self._cancel_loopback()
         text = (stderr or "").strip()
         return text[-2000:] if text else "FFmpeg exited before the recording started."
 
@@ -281,10 +379,69 @@ class ScreenRecorder:
         if not self.request:
             raise RuntimeError("No recording was started.")
         dest = self.request.dest
+        loopback = self._loopback
+        self._loopback = None
         if self.process:
             stop_process(self.process)
             self.process = None
         self.request = None
-        if not dest.is_file() or dest.stat().st_size < 1000:
-            raise RuntimeError("Recording file was not written. Check FFmpeg and the selected devices.")
+        wav: Path | None = None
+        try:
+            if loopback:
+                wav = loopback.stop()
+            if not dest.is_file() or dest.stat().st_size < 1000:
+                raise RuntimeError(
+                    "Recording file was not written. Check FFmpeg and the selected devices."
+                )
+            if wav:
+                _mix_loopback(dest, wav)
+        finally:
+            if wav:
+                wav.unlink(missing_ok=True)
         return dest
+
+    def _cancel_loopback(self) -> None:
+        recorder = self._loopback
+        self._loopback = None
+        if recorder:
+            recorder.cancel()
+
+
+def _mix_loopback(video: Path, wav: Path) -> None:
+    info = media_info(video)
+    mixed = video.with_name(f"{video.stem}.mix{video.suffix}")
+    try:
+        if info.get("has_audio"):
+            graph = (
+                "[0:a]aresample=44100[m];"
+                "[1:a]aresample=44100[s];"
+                "[m][s]amix=inputs=2:duration=longest:dropout_transition=2,apad[a]"
+            )
+        else:
+            graph = "[1:a]aresample=44100,apad[a]"
+        run(
+            [
+                "-i",
+                str(video),
+                "-i",
+                str(wav),
+                "-filter_complex",
+                graph,
+                "-map",
+                "0:v",
+                "-map",
+                "[a]",
+                "-shortest",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "160k",
+                str(mixed),
+            ]
+        )
+        mixed.replace(video)
+    finally:
+        if mixed.exists():
+            mixed.unlink(missing_ok=True)

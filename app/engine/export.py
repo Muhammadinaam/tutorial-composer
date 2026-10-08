@@ -663,7 +663,7 @@ def export_project(
         on_progress=hook("Joining clips", 0.0, 0.28),
     )
     picture = joined
-    blurs = list(getattr(project, "blurs", []) or [])
+    blurs = project.regions()
     if blurs:
         emit("Blurring regions…", percent_start + span * 0.28)
         picture = work / "blurred.mp4"

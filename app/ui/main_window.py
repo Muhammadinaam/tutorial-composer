@@ -67,6 +67,7 @@ from app.engine.project import (
     Pause,
     Project,
     clamp_speed,
+    clone_region,
     is_project_bundle,
     load_project,
     media_dir_for,
@@ -78,6 +79,7 @@ from app.engine.script import (
     parse_timestamp,
 )
 from app.engine.settings import cache_dir, load_settings, save_settings
+from app.engine.transcribe import transcribe_timeline
 from app.engine.timeline import TimelinePlan, build_timeline
 from app.engine.translate import LANGUAGE_NAMES, estimate_keep_terms, polish_cues, translate_cues
 from app.engine.tts import is_cached, synthesize, synthesize_with_duration
@@ -473,6 +475,11 @@ class MainWindow(QMainWindow):
         script_box.addWidget(self.warning_label, 0)
         script_btns = QHBoxLayout()
         script_btns.setSpacing(4)
+        self.from_audio_btn = QPushButton("From audio")
+        self.from_audio_btn.setToolTip(
+            "Listen to the timeline audio in this tab's language and fill the script. "
+            "Generate voices after you edit the lines."
+        )
         self.generate_btn = QPushButton("Generate voices")
         self.generate_btn.setObjectName("accentButton")
         self.fix_btn = QPushButton("Fix language")
@@ -481,6 +488,7 @@ class MainWindow(QMainWindow):
             "is rewritten into this tab's language."
         )
         self.translate_btn = QPushButton("Translate")
+        script_btns.addWidget(self.from_audio_btn)
         script_btns.addWidget(self.generate_btn)
         script_btns.addWidget(self.fix_btn)
         script_btns.addWidget(self.translate_btn)
@@ -511,7 +519,8 @@ class MainWindow(QMainWindow):
         self.highlight_btn = QPushButton("Highlight")
         self.highlight_btn.setCheckable(True)
         self.highlight_btn.setToolTip(
-            "Drag on the preview to draw a red box. Drag the red bar on V1 to choose when it shows."
+            "Drag on the preview to draw a red box for this language. "
+            "Drag the red bar on V1 to choose when it shows. Other language tabs keep their own times."
         )
         self.mark_in_btn = QPushButton("Mark In")
         self.mark_out_btn = QPushButton("Mark Out")
@@ -678,6 +687,7 @@ class MainWindow(QMainWindow):
         self.tts_combo.currentIndexChanged.connect(self._tts_provider_changed)
         self.voice_combo.currentIndexChanged.connect(self._voice_changed)
         self.preview_voice_btn.clicked.connect(self.preview_voice)
+        self.from_audio_btn.clicked.connect(self.script_from_audio)
         self.generate_btn.clicked.connect(self.generate_voices)
         self.fix_btn.clicked.connect(self.fix_language)
         self.translate_btn.clicked.connect(self.translate_script)
@@ -844,6 +854,7 @@ class MainWindow(QMainWindow):
     def _worker_done(self) -> None:
         self._hide_export_progress()
         self.generate_btn.setEnabled(True)
+        self.from_audio_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
         self.fix_btn.setEnabled(True)
         self.translate_btn.setEnabled(True)
@@ -1155,7 +1166,7 @@ class MainWindow(QMainWindow):
             extra_end=self._cue_end(),
             mark_in=self.project.mark_in,
             mark_out=self.project.mark_out,
-            blurs=self.project.blurs,
+            blurs=self.project.regions(),
             selected_blur=self._selected_blur_id,
             selected_cue=self._selected_cue,
         )
@@ -1390,6 +1401,8 @@ class MainWindow(QMainWindow):
         for narration in self.project.narrations.values():
             narration.cues = remap_cues(old, new, narration.cues)
         self.project.blurs = remap_blurs(old, new, self.project.blurs)
+        for narration in self.project.narrations.values():
+            narration.highlights = remap_blurs(old, new, narration.highlights)
         self.project.pauses = remap_pauses(old, new, self.project.pauses)
         if self.project.mark_in is not None:
             self.project.mark_in = remap_joined_time(old, new, self.project.mark_in)
@@ -2629,12 +2642,14 @@ class MainWindow(QMainWindow):
         if save_current and self.project.lang in self.project.narrations:
             self.project.current().cues = [c for c in self._cues_from_table() if c.text.strip()]
             self._save_tts()
+        source = self.project.current()
         self.project.lang = code
         if code not in self.project.narrations:
             match = matching_voice(self.voices, code)
             self.project.narrations[code] = Narration(
                 lang=code,
                 voice=match.id if match else self.project.voice,
+                highlights=[clone_region(item) for item in source.highlights],
             )
         current = self.project.current()
         self.project.voice = current.voice
@@ -2649,7 +2664,10 @@ class MainWindow(QMainWindow):
             self.voice_combo.setCurrentIndex(voice_index)
         self._rebuild_lang_tabs()
         self._switching_lang = False
+        if self._selected_blur_id and self._selected_blur() is None:
+            self._selected_blur_id = ""
         self.refresh_timeline()
+        self._sync_preview_overlays()
         self.refresh_warnings()
         self._persist_voice_prefs()
 
@@ -2730,7 +2748,7 @@ class MainWindow(QMainWindow):
         self.preview.set_frame(image.copy())
 
     def _selected_blur(self) -> BlurRegion | None:
-        for blur in self.project.blurs:
+        for blur in self.project.regions():
             if blur.id == self._selected_blur_id:
                 return blur
         return None
@@ -2738,7 +2756,7 @@ class MainWindow(QMainWindow):
     def _sync_preview_overlays(self) -> None:
         if not hasattr(self, "preview"):
             return
-        self.preview.set_regions(self.project.blurs, self._selected_blur_id, self.playhead)
+        self.preview.set_regions(self.project.regions(), self._selected_blur_id, self.playhead)
 
     def _region_tool_toggled(self, which: str, on: bool) -> None:
         other = self.highlight_btn if which == "blur" else self.blur_btn
@@ -2787,7 +2805,10 @@ class MainWindow(QMainWindow):
         region.end = min(total, region.end)
         if region.end - region.start < 0.08:
             region.start = max(0.0, region.end - 0.08)
-        self.project.blurs.append(region)
+        if region.is_highlight():
+            self.project.current().highlights.append(region)
+        else:
+            self.project.blurs.append(region)
         self._selected_blur_id = region.id
         if self.playhead < region.start - 0.001 or self.playhead > region.end + 0.001:
             self._seek_joined(region.start)
@@ -2865,7 +2886,7 @@ class MainWindow(QMainWindow):
             )
 
     def _blur_rect_edited(self, blur_id: str, x: float, y: float, w: float, h: float) -> None:
-        for blur in self.project.blurs:
+        for blur in self.project.regions():
             if blur.id == blur_id:
                 blur.x, blur.y, blur.w, blur.h = x, y, w, h
                 break
@@ -2878,10 +2899,18 @@ class MainWindow(QMainWindow):
             return False
         selected = self._selected_blur()
         highlight = bool(selected and selected.is_highlight())
-        before = len(self.project.blurs)
-        self.project.blurs = [blur for blur in self.project.blurs if blur.id != blur_id]
+        if highlight:
+            before = len(self.project.current().highlights)
+            self.project.current().highlights = [
+                blur for blur in self.project.current().highlights if blur.id != blur_id
+            ]
+            removed = len(self.project.current().highlights) != before
+        else:
+            before = len(self.project.blurs)
+            self.project.blurs = [blur for blur in self.project.blurs if blur.id != blur_id]
+            removed = len(self.project.blurs) != before
         self._selected_blur_id = ""
-        if len(self.project.blurs) == before:
+        if not removed:
             return False
         self.refresh_timeline()
         self._sync_preview_overlays()
@@ -2916,6 +2945,8 @@ class MainWindow(QMainWindow):
         for narration in self.project.narrations.values():
             narration.cues = ripple_cues(narration.cues, lo, hi)
         self.project.blurs = ripple_blurs(self.project.blurs, lo, hi)
+        for narration in self.project.narrations.values():
+            narration.highlights = ripple_blurs(narration.highlights, lo, hi)
         self.project.pauses = ripple_pauses(self.project.pauses, lo, hi)
         if self._selected_blur_id and not self._selected_blur():
             self._selected_blur_id = ""
@@ -3014,6 +3045,62 @@ class MainWindow(QMainWindow):
         self._preview_player.setSource(QUrl.fromLocalFile(str(Path(path).resolve())))
         self._preview_player.play()
         self._set_status("Playing voice preview.")
+
+    def script_from_audio(self) -> None:
+        if not self.project.clips:
+            QMessageBox.information(self, "From audio", "Add a video first.")
+            return
+        key = (self.settings().get("openai_api_key") or "").strip()
+        if not key:
+            QMessageBox.information(
+                self,
+                "From audio",
+                "Add an OpenAI API key in Settings to draft the script from the recording.",
+            )
+            return
+        if self._busy():
+            self.statusBar().showMessage("Please wait for the current task to finish.")
+            return
+        existing = [cue for cue in self._cues_from_table() if cue.text.strip()]
+        if existing:
+            answer = QMessageBox.question(
+                self,
+                "From audio",
+                "Replace the current script with text from the recording?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        lang = self.project.lang
+        clips = list(self.project.clips)
+
+        def work(progress):
+            progress(f"Listening in {LANGUAGE_NAMES.get(lang, lang)}...", 15)
+            cues = transcribe_timeline(clips, lang, key)
+            progress("Script ready.", 100)
+            return cues
+
+        self.from_audio_btn.setEnabled(False)
+        self._start_worker(work, self._script_from_audio, progress_bar=True)
+
+    def _script_from_audio(self, cues) -> None:
+        if not cues:
+            self._set_status("No speech was found in the recording.")
+            return
+        self._begin_edit()
+        self.project.current().cues = list(cues)
+        self.project.sync_from_current()
+        self._selected_cue = -1
+        self._clear_tts(self.project.lang)
+        self._load_cues_into_table()
+        self.refresh_warnings()
+        self.refresh_timeline()
+        self._sync_narration()
+        self._commit_edit()
+        language = LANGUAGE_NAMES.get(self.project.lang, self.project.lang)
+        self._set_status(
+            f"Wrote {len(cues)} line(s) in {language} from the recording. "
+            "Generate voices to speak them."
+        )
 
     def generate_voices(self) -> None:
         self.project.current().cues = self._cues_from_table()
@@ -3176,10 +3263,17 @@ class MainWindow(QMainWindow):
         self.translate_btn.setEnabled(True)
         target, cues = result
         match = matching_voice(self.voices, target)
+        existing = self.project.narrations.get(target)
+        source = self.project.current()
         self.project.narrations[target] = Narration(
             lang=target,
             voice=match.id if match else self.project.voice,
             cues=cues,
+            highlights=(
+                list(existing.highlights)
+                if existing
+                else [clone_region(item) for item in source.highlights]
+            ),
         )
         self._clear_tts(target)
         self._apply_language(target)
