@@ -316,8 +316,72 @@ def _build_args(request: CaptureRequest, *, use_ddagrab: bool) -> list[str]:
     )
     if audio_count:
         args.extend(["-c:a", "aac", "-b:a", "160k"])
+    # Fragments keep the file playable when FFmpeg is killed before it can
+    # write a normal moov atom (device loss, or a hard stop).
+    args.extend(
+        [
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof",
+            "-flush_packets",
+            "1",
+        ]
+    )
     args.append(str(request.dest))
     return args
+
+
+def _trim_partial_atom(path: Path) -> None:
+    """Drop a trailing fragment that was cut off when FFmpeg was killed."""
+    total = path.stat().st_size
+    last = 0
+    with path.open("rb") as handle:
+        while True:
+            offset = handle.tell()
+            header = handle.read(8)
+            if len(header) < 8:
+                break
+            size = int.from_bytes(header[:4], "big")
+            header_len = 8
+            if size == 1:
+                extra = handle.read(8)
+                if len(extra) < 8:
+                    break
+                size = int.from_bytes(extra, "big")
+                header_len = 16
+            if size < header_len or offset + size > total:
+                break
+            handle.seek(offset + size)
+            last = offset + size
+    if 0 < last < total:
+        with path.open("rb+") as handle:
+            handle.truncate(last)
+
+
+def _prepare_recording(path: Path) -> None:
+    """Turn a capture, including one that was killed, into a normal MP4."""
+    if not path.is_file() or path.stat().st_size < 1000:
+        return
+    _trim_partial_atom(path)
+    fixed = path.with_name(f"{path.stem}.fast{path.suffix}")
+    try:
+        run(
+            [
+                "-i",
+                str(path),
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(fixed),
+            ]
+        )
+        if fixed.is_file() and fixed.stat().st_size > 1000:
+            fixed.replace(path)
+    except Exception:
+        pass
+    finally:
+        if fixed.exists():
+            fixed.unlink(missing_ok=True)
 
 
 class ScreenRecorder:
@@ -361,9 +425,11 @@ class ScreenRecorder:
             return False
         if self.process.poll() is None:
             return False
+        failed = self.process
         self._used_ddagrab = False
         args = _build_args(_dshow_request(self.request), use_ddagrab=False)
         self.process = start_process(args)
+        stop_process(failed, timeout=1)
         return True
 
     def early_error(self) -> str | None:
@@ -371,7 +437,10 @@ class ScreenRecorder:
             return None
         stderr = stop_process(self.process, timeout=2)
         self.process = None
+        dest = self.request.dest if self.request else None
         self._cancel_loopback()
+        if dest and dest.is_file():
+            _prepare_recording(dest)
         text = (stderr or "").strip()
         return text[-2000:] if text else "FFmpeg exited before the recording started."
 
@@ -389,9 +458,18 @@ class ScreenRecorder:
         try:
             if loopback:
                 wav = loopback.stop()
+            _prepare_recording(dest)
             if not dest.is_file() or dest.stat().st_size < 1000:
                 raise RuntimeError(
                     "Recording file was not written. Check FFmpeg and the selected devices."
+                )
+            try:
+                info = media_info(dest)
+            except Exception as exc:
+                raise RuntimeError(str(exc)) from exc
+            if not info.get("has_video") or float(info.get("duration") or 0) <= 0:
+                raise RuntimeError(
+                    "This recording is incomplete. It was cut off before it finished saving."
                 )
             if wav:
                 _mix_loopback(dest, wav)

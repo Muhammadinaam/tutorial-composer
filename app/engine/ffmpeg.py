@@ -197,47 +197,61 @@ def _progress_seconds(line: str) -> float | None:
     return None
 
 
+# stderr is drained while a capture runs. A full pipe blocks FFmpeg, and
+# killing it then leaves an MP4 with no moov atom.
+_capture_logs: dict[int, dict] = {}
+
+
 def start_process(args: list[str]) -> subprocess.Popen:
-    cmd = [ffmpeg_path(), "-hide_banner", "-y", *args]
+    cmd = [ffmpeg_path(), "-hide_banner", "-nostats", "-loglevel", "warning", "-y", *args]
     kwargs = _hide_window_kwargs()
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-    return subprocess.Popen(
+    process = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         **kwargs,
     )
+    chunks: list[bytes] = []
+
+    def _drain() -> None:
+        if process.stderr:
+            chunks.append(process.stderr.read() or b"")
+
+    thread = threading.Thread(target=_drain, daemon=True)
+    thread.start()
+    _capture_logs[id(process)] = {"chunks": chunks, "thread": thread}
+    return process
+
+
+def _capture_stderr(process: subprocess.Popen) -> str:
+    state = _capture_logs.pop(id(process), None)
+    if not state:
+        return ""
+    state["thread"].join(timeout=3)
+    return b"".join(state["chunks"]).decode("utf-8", errors="replace")
 
 
 def stop_process(process: subprocess.Popen, timeout: float = 12.0) -> str:
     if process.poll() is None:
         try:
-            if process.stdin:
+            if process.stdin and not process.stdin.closed:
                 process.stdin.write(b"q")
                 process.stdin.flush()
+                process.stdin.close()
         except Exception:
-            try:
-                process.terminate()
-            except Exception:
-                pass
+            pass
         try:
-            _stdout, stderr = process.communicate(timeout=timeout)
+            process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             process.kill()
-            _stdout, stderr = process.communicate(timeout=3)
-        detail = stderr or b""
-        if isinstance(detail, bytes):
-            return detail.decode("utf-8", errors="replace")
-        return str(detail)
-    try:
-        _stdout, stderr = process.communicate(timeout=1)
-    except Exception:
-        stderr = b""
-    if isinstance(stderr, bytes):
-        return stderr.decode("utf-8", errors="replace")
-    return str(stderr or "")
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+    return _capture_stderr(process)
 
 
 def run(
@@ -362,18 +376,31 @@ def _parse_ffmpeg_info(path: str | Path) -> dict:
 def probe(path: str | Path) -> dict:
     if not ffprobe_path():
         return {}
-    raw = run(
-        [
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            str(path),
-        ],
-        tool="ffprobe",
-    )
+    try:
+        raw = run(
+            [
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                str(path),
+            ],
+            tool="ffprobe",
+        )
+    except RuntimeError as exc:
+        detail = str(exc).strip()
+        if "moov atom not found" in detail.lower():
+            raise RuntimeError(
+                "This video is incomplete. The recording was cut off before it finished saving."
+            ) from exc
+        lines = [
+            line.strip()
+            for line in detail.splitlines()
+            if line.strip() and line.strip() not in {"{", "}"}
+        ]
+        raise RuntimeError(lines[-1] if lines else "Could not read this file.") from exc
     return json.loads(raw or "{}")
 
 

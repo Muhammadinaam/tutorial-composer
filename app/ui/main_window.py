@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from time import monotonic
 
@@ -58,7 +59,7 @@ from app.engine.edl import (
 )
 from app.engine.history import EditHistory
 from app.engine.export import export_project
-from app.engine.ffmpeg import ffmpeg_available
+from app.engine.ffmpeg import audio_duration, ffmpeg_available, run
 from app.engine.project import (
     PROJECT_FILENAME,
     BlurRegion,
@@ -99,6 +100,45 @@ from app.ui.timeline_widget import TimelineWidget
 from app.ui.voice_cue import VoiceCuePlayer
 from app.ui.win_hotkey import WinRecordHotkeys
 from app.ui.workers import TaskWorker
+
+
+def _split_voice_text(text: str, fraction: float) -> tuple[str, str] | None:
+    words = text.split()
+    if len(words) < 2:
+        return None
+    cut = int(round(len(words) * float(fraction)))
+    cut = max(1, min(len(words) - 1, cut))
+    return " ".join(words[:cut]), " ".join(words[cut:])
+
+
+def _split_voice_file(path: str, at: float) -> tuple[str, str, float, float]:
+    stamp = uuid.uuid4().hex[:12]
+    folder = cache_dir()
+    left = folder / f"voice_{stamp}_a.wav"
+    right = folder / f"voice_{stamp}_b.wav"
+    run(
+        [
+            "-i",
+            path,
+            "-af",
+            f"atrim=end={at:.3f},asetpts=PTS-STARTPTS",
+            str(left),
+        ]
+    )
+    try:
+        run(
+            [
+                "-i",
+                path,
+                "-af",
+                f"atrim=start={at:.3f},asetpts=PTS-STARTPTS",
+                str(right),
+            ]
+        )
+    except Exception:
+        left.unlink(missing_ok=True)
+        raise
+    return str(left), str(right), audio_duration(left), audio_duration(right)
 
 
 class _WarningNotes(QScrollArea):
@@ -510,7 +550,7 @@ class MainWindow(QMainWindow):
         self.add_music_btn = QPushButton("Add music")
         self.remove_music_btn = QPushButton("Remove music")
         self.split_btn = QPushButton("Split")
-        self.split_btn.setToolTip("Cut the selected clip at the red playhead (S)")
+        self.split_btn.setToolTip("Cut the selected video or voice at the red playhead (S)")
         self.pause_btn = QPushButton("Add pause")
         self.pause_btn.setToolTip(
             "Split the picture at the playhead and insert a frozen frame. V1 gets longer. "
@@ -1747,6 +1787,9 @@ class MainWindow(QMainWindow):
         self._commit_edit()
 
     def split_at_playhead(self) -> None:
+        if self._selected_cue >= 0:
+            self._split_selected_voice()
+            return
         mapped = map_joined_to_clip(self.project.clips, self.playhead)
         if not mapped:
             return
@@ -1767,6 +1810,83 @@ class MainWindow(QMainWindow):
         self.refresh_warnings()
         self._commit_edit()
         self._set_status("Split. Select the piece you do not want and press Delete.")
+
+    def _split_selected_voice(self) -> None:
+        spans = self._cue_spans()
+        index = self._selected_cue
+        spoken = self._spoken_cues()
+        if not (0 <= index < len(spans)) or not (0 <= index < len(spoken)):
+            self._set_status("Select a voice on VO, then Split.")
+            return
+        start = float(spans[index][0])
+        if len(self.tts_durations) == len(spoken):
+            duration = float(self.tts_durations[index])
+        else:
+            duration = float(spans[index][1])
+        cut = self.playhead - start
+        if cut <= 0.08 or cut >= duration - 0.08:
+            self._set_status("Move the red line onto the voice, then Split.")
+            return
+        pieces = _split_voice_text(spoken[index].text, cut / duration)
+        if pieces is None:
+            self._set_status("This voice needs at least two words before it can be split.")
+            return
+        left_text, right_text = pieces
+        current = self.project.current()
+        try:
+            place = current.cues.index(spoken[index])
+        except ValueError:
+            self._set_status("Select a voice on VO, then Split.")
+            return
+        original = current.cues[place]
+        left_dur = cut
+        right_dur = max(0.08, duration - cut)
+        paths = list(self.tts_paths)
+        durations = list(self.tts_durations)
+        has_file = (
+            len(paths) == len(spoken)
+            and len(durations) == len(spoken)
+            and Path(paths[index]).is_file()
+        )
+        self._begin_edit()
+        try:
+            if has_file:
+                left_path, right_path, left_dur, right_dur = _split_voice_file(paths[index], cut)
+                paths[index:index + 1] = [left_path, right_path]
+                durations[index:index + 1] = [left_dur, right_dur]
+            elif len(durations) == len(spoken):
+                durations[index:index + 1] = [left_dur, right_dur]
+                if len(paths) == len(spoken):
+                    paths[index:index + 1] = ["", ""]
+        except Exception as exc:
+            self._history.cancel()
+            self._set_status(str(exc))
+            return
+        right_start = original.video_time + left_dur
+        current.cues[place:place + 1] = [
+            Cue(original.video_time, left_text, original.should_video_stop),
+            Cue(right_start, right_text, original.should_video_stop),
+        ]
+        self.project.sync_from_current()
+        self.tts_paths = paths
+        self.tts_durations = durations
+        if len(self.tts_durations) == len(self._spoken_cues()):
+            self._rebuild_plan_from_tts()
+        else:
+            self.plan = None
+        self._loading_table = True
+        self._load_cues_into_table()
+        self._loading_table = False
+        self._selected_cue = index + 1
+        if 0 <= self._selected_cue < self.cue_table.rowCount():
+            self.cue_table.setCurrentCell(self._selected_cue, 1)
+        self.selected_index = -1
+        self._music_selected = False
+        self.refresh_timeline()
+        self.refresh_warnings()
+        self._sync_narration()
+        self._commit_edit()
+        self._set_status("Split the voice. Select the piece you do not want and press Delete.")
 
     def add_pause_at_playhead(self) -> None:
         if not self.project.clips:
