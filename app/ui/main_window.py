@@ -229,6 +229,8 @@ class MainWindow(QMainWindow):
         self._narration_finished = -1
         self._narration_gen = 0
         self._narration_token = 0
+        self._narration_offset = 0.0
+        self._voice_resume: tuple[int, float] | None = None
         self._audio_hold = False
         self._hold_at = 0.0
         self._hold_started = 0.0
@@ -1100,6 +1102,11 @@ class MainWindow(QMainWindow):
             self.tts_paths, self.tts_durations, self.plan = stored
         else:
             self.tts_paths, self.tts_durations, self.plan = [], [], None
+        self._cache_voice_clips()
+
+    def _cache_voice_clips(self) -> None:
+        if self.tts_paths:
+            self.voice_sfx.preload(self.tts_paths)
 
     def _save_tts(self) -> None:
         if self.plan and self.tts_paths:
@@ -2011,9 +2018,6 @@ class MainWindow(QMainWindow):
         if self._maybe_start_pause():
             self._show_current_media(force=False)
             return
-        due = self._cue_index_at(self.playhead, lead=self.NARRATION_DUE_SLACK)
-        if due is not None and self._cue_wants_stop(due):
-            self._begin_video_freeze(due)
         self._sync_narration(force=True)
         self._show_current_media(force=False)
         self._sync_music(force=True)
@@ -2022,6 +2026,7 @@ class MainWindow(QMainWindow):
         self._start_clock_if_needed()
 
     def _pause_all(self) -> None:
+        self._remember_voice_spot()
         self._warmup_timer.stop()
         self._playing = False
         self._audio_hold = False
@@ -2243,6 +2248,8 @@ class MainWindow(QMainWindow):
         self._narration_pending = None
         self._narration_index = -1
         self._narration_finished = -1
+        self._narration_offset = 0.0
+        self._voice_resume = None
         self._sfx_play_when_ready = False
         self._stop_sfx()
 
@@ -2376,7 +2383,7 @@ class MainWindow(QMainWindow):
         if self._pause_holding:
             self._end_pause_hold(resume=True)
 
-    def _begin_video_freeze(self, index: int) -> None:
+    def _begin_video_freeze(self, index: int, audio_elapsed: float = 0.0) -> None:
         if self._video_frozen and self._freeze_index == index:
             return
         if self._video_frozen and self._freeze_clock:
@@ -2385,14 +2392,17 @@ class MainWindow(QMainWindow):
         self._freeze_index = index
         self._freeze_clock = monotonic()
         duration = 0.0
+        elapsed = max(0.0, float(audio_elapsed))
         if self.plan and 0 <= index < len(self.plan.cues):
             cue = self.plan.cues[index]
             duration = cue.tts_duration
-            self.playhead = cue.video_time
+            if elapsed <= 0.04:
+                self.playhead = cue.video_time
         self.player.pause()
         self._image_clock.stop()
         self._refresh_transport()
-        self._freeze_timer.start(int(max(0.5, duration + 0.6) * 1000))
+        remaining = max(0.2, duration - elapsed)
+        self._freeze_timer.start(int((remaining + 0.6) * 1000))
 
     def _end_video_freeze(self, resume: bool = True) -> None:
         if not self._video_frozen:
@@ -2471,7 +2481,7 @@ class MainWindow(QMainWindow):
         self._sfx_play_when_ready = False
         self._apply_voice_volume()
         try:
-            self.voice_sfx.play()
+            self.voice_sfx.play(self._narration_offset)
         except Exception:
             self._fail_voice("Voice could not play. Generate voices, then Play again.")
             return
@@ -2509,8 +2519,14 @@ class MainWindow(QMainWindow):
         self._narration_finished = self._narration_index
         finished = self._narration_index
         self._narration_index = -1
+        self._voice_resume = None
+        held = self._waiting_for_voice or self._audio_hold
+        self._waiting_for_voice = False
+        self._audio_hold = False
         if self._video_frozen and (self._freeze_index == finished or finished < 0):
             self._end_video_freeze(resume=True)
+        elif held and self._playing and not self._scrubbing:
+            self._resume_transport()
 
     def _fail_voice(self, message: str) -> None:
         self._waiting_for_voice = False
@@ -2528,12 +2544,36 @@ class MainWindow(QMainWindow):
         if self._video_frozen:
             self._end_video_freeze(resume=True)
 
-    def _start_narration(self, index: int, play: bool) -> None:
+    def _remember_voice_spot(self) -> None:
+        index = self._narration_index
+        if index < 0 or not self.voice_sfx.isPlaying():
+            return
+        # A freeze keeps the playhead on the cue start while speech continues,
+        # so the sample position is the only place Play can resume from.
+        if self._cue_wants_stop(index):
+            self._voice_resume = (index, self.voice_sfx.position_seconds())
+            return
+        self._voice_resume = None
+
+    def _voice_offset_for(self, index: int) -> float:
+        if not self.plan or index < 0 or index >= len(self.plan.cues):
+            return 0.0
+        cue = self.plan.cues[index]
+        into = max(0.0, self.playhead - float(cue.video_time))
+        saved = self._voice_resume
+        if saved and saved[0] == index and self._cue_wants_stop(index) and into < 0.12:
+            return max(0.0, saved[1])
+        if saved and saved[0] == index and abs(into - saved[1]) > 0.25:
+            self._voice_resume = None
+        return into
+
+    def _start_narration(self, index: int, play: bool, offset: float = 0.0) -> None:
         url = self._narration_url(index)
         if url is None:
             return
         self._narration_index = index
         self._narration_token = self._narration_gen
+        self._narration_offset = max(0.0, float(offset))
         if self.voice_sfx.source() != url:
             self._stop_sfx()
             self.voice_sfx.setSource(url)
@@ -2582,16 +2622,28 @@ class MainWindow(QMainWindow):
         if not self._playing:
             self._start_narration(due, False)
             return
-        cue_time = self.plan.cues[due].video_time
+        cue = self.plan.cues[due]
+        cue_time = cue.video_time
+        offset = self._voice_offset_for(due)
+        if offset >= max(0.05, float(cue.tts_duration)) - 0.04:
+            self._narration_finished = due
+            self._narration_index = -1
+            self._voice_resume = None
+            return
         if self._cue_wants_stop(due):
-            self._begin_video_freeze(due)
+            self._begin_video_freeze(due, offset)
         elif self._video_frozen:
             self._end_video_freeze(resume=False)
         if not force and due == self._narration_index and (audible or self._waiting_for_voice):
             return
-        self.playhead = cue_time
-        self._hold_transport(cue_time)
-        self._start_narration(due, True)
+        if offset <= 0.04:
+            self.playhead = cue_time
+            hold_at = cue_time
+        else:
+            hold_at = self.playhead
+        self._voice_resume = None
+        self._hold_transport(hold_at)
+        self._start_narration(due, True, offset)
 
     def _retry_narration(self) -> None:
         if self._warming or self._scrubbing:
@@ -2603,7 +2655,7 @@ class MainWindow(QMainWindow):
             return
         if self._sfx_play_when_ready:
             return
-        self._start_narration(self._narration_index, True)
+        self._start_narration(self._narration_index, True, self._narration_offset)
 
     def _sync_music(self, force: bool = False) -> None:
         path = self.project.music_path
@@ -3276,6 +3328,7 @@ class MainWindow(QMainWindow):
     def _voices_ready(self, result) -> None:
         self.tts_paths, self.tts_durations, self.plan = result
         self._save_tts()
+        self._cache_voice_clips()
         self.generate_btn.setEnabled(True)
         self._load_cues_into_table()
         self.refresh_warnings()
@@ -3472,6 +3525,7 @@ class MainWindow(QMainWindow):
     def _export_done(self, result) -> None:
         dest, paths, durations, plan = result
         self.tts_paths, self.tts_durations, self.plan = paths, durations, plan
+        self._cache_voice_clips()
         self.export_btn.setEnabled(True)
         self._hide_export_progress()
         self.refresh_warnings()
