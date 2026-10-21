@@ -580,7 +580,7 @@ def mix_tts(
         audio_labels.append(f"[{label}]")
         next_index += 1
 
-    gain = max(0.0, min(4.0, float(voice_volume) * 2.8))
+    gain = max(0.0, min(4.0, float(voice_volume) * 1.2))
     for delay_sec, path in tts_items:
         inputs.extend(["-i", str(path)])
         delay_ms = max(0, int(round(delay_sec * 1000)))

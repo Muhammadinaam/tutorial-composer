@@ -26,12 +26,12 @@ FALLBACK_EDGE_VOICES = [
 ]
 
 OPENAI_VOICES = [
+    ("nova", "Nova", "en", "Female", "OpenAI"),
     ("alloy", "Alloy", "en", "Neutral", "OpenAI"),
     ("ash", "Ash", "en", "Male", "OpenAI"),
     ("coral", "Coral", "en", "Female", "OpenAI"),
     ("echo", "Echo", "en", "Male", "OpenAI"),
     ("fable", "Fable", "en", "Neutral", "OpenAI"),
-    ("nova", "Nova", "en", "Female", "OpenAI"),
     ("onyx", "Onyx", "en", "Male", "OpenAI"),
     ("sage", "Sage", "en", "Neutral", "OpenAI"),
     ("shimmer", "Shimmer", "en", "Female", "OpenAI"),

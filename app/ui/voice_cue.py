@@ -212,6 +212,12 @@ class VoiceCuePlayer(QObject):
         if was:
             self.playingChanged.emit()
 
+    def forget(self) -> None:
+        self.stop()
+        self._cache.clear()
+        self._clip = None
+        self._duration = 0.0
+
     def _clip_for(self, path: Path) -> CachedVoice:
         stat = path.stat()
         key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)

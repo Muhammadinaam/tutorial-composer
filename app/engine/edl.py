@@ -173,6 +173,8 @@ def remap_cues(old_clips: list[Clip], new_clips: list[Clip], cues: list[Cue]) ->
             video_time=remap_joined_time(old_clips, new_clips, cue.video_time),
             text=cue.text,
             should_video_stop=cue.should_video_stop,
+            audio_path=cue.audio_path,
+            audio_duration=cue.audio_duration,
         )
         for cue in cues
     ]
@@ -253,6 +255,8 @@ def ripple_cues(cues: list[Cue], start: float, end: float) -> list[Cue]:
                     video_time=max(0.0, cue.video_time - gap),
                     text=cue.text,
                     should_video_stop=cue.should_video_stop,
+                    audio_path=cue.audio_path,
+                    audio_duration=cue.audio_duration,
                 )
             )
         elif cue.video_time < lo + 0.001:

@@ -68,6 +68,8 @@ def load_settings() -> dict:
                 data.update({k: stored.get(k, data[k]) for k in DEFAULTS})
         except (OSError, json.JSONDecodeError):
             pass
+    if not str(data.get("voice_openai") or "").strip():
+        data["voice_openai"] = "nova"
     return data
 
 

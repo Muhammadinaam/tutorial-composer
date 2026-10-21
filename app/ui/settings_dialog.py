@@ -44,9 +44,9 @@ class SettingsDialog(QDialog):
         hint = QLabel(
             "Keys stay on this computer only. The script panel switches Edge and "
             "OpenAI without reopening Settings. Edge is free for drafts. OpenAI "
-            "speaks with gpt-4o-mini-tts, and a line that was already generated "
-            "with the same voice is reused. OpenAI is also used to auto-translate "
-            "the script and to write narration from the video."
+            "speaks with gpt-4o-mini-tts in a warm teacher tone, and a line that "
+            "was already generated with the same voice is reused. OpenAI is also "
+            "used to auto-translate the script."
         )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)

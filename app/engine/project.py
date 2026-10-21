@@ -52,13 +52,21 @@ class Cue:
     video_time: float
     text: str
     should_video_stop: bool = False
+    audio_path: str = ""
+    audio_duration: float = 0.0
 
     @classmethod
     def from_dict(cls, data: dict) -> Cue:
+        try:
+            duration = float(data.get("audio_duration") or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
         return cls(
             video_time=float(data.get("video_time", 0.0)),
             text=str(data.get("text", "")),
             should_video_stop=bool(data.get("should_video_stop", False)),
+            audio_path=str(data.get("audio_path") or ""),
+            audio_duration=duration,
         )
 
 
@@ -402,7 +410,7 @@ def _store_media(
 
 
 def collect_media(project: Project, root: str | Path) -> list[str]:
-    """Copy clips and the soundtrack into ``root/media`` and point the project at those copies.
+    """Copy clips, the soundtrack, and narration into ``root/media``.
 
     Files already in that media folder stay where they are. Missing files are left unchanged.
     Returns the display names of missing files.
@@ -414,6 +422,7 @@ def collect_media(project: Project, root: str | Path) -> list[str]:
     created: list[Path] = []
     clip_paths = [clip.path for clip in project.clips]
     music_path = project.music_path
+    audio_before = _cue_audio_snapshot(project)
     try:
         for clip in project.clips:
             if clip.is_pause:
@@ -422,10 +431,15 @@ def collect_media(project: Project, root: str | Path) -> list[str]:
             clip.path = _store_media(clip.path, media, placed, missing, created)
         if project.music_path:
             project.music_path = _store_media(project.music_path, media, placed, missing, created)
+        for cue, _old in audio_before:
+            if cue.audio_path:
+                cue.audio_path = _store_media(cue.audio_path, media, placed, missing, created)
     except Exception:
         for clip, old in zip(project.clips, clip_paths):
             clip.path = old
         project.music_path = music_path
+        for cue, old in audio_before:
+            cue.audio_path = old
         for path in reversed(created):
             try:
                 path.unlink()
@@ -433,6 +447,39 @@ def collect_media(project: Project, root: str | Path) -> list[str]:
                 pass
         raise
     return missing
+
+
+def _cue_audio_snapshot(project: Project) -> list[tuple[Cue, str]]:
+    seen: set[int] = set()
+    rows: list[tuple[Cue, str]] = []
+    for narration in project.narrations.values():
+        for cue in narration.cues:
+            if id(cue) in seen:
+                continue
+            seen.add(id(cue))
+            rows.append((cue, cue.audio_path))
+    for cue in project.cues:
+        if id(cue) in seen:
+            continue
+        seen.add(id(cue))
+        rows.append((cue, cue.audio_path))
+    return rows
+
+
+def _resolve_cue_audio(cues: list[Cue], root: Path) -> None:
+    seen: set[int] = set()
+    for cue in cues:
+        if id(cue) in seen:
+            continue
+        seen.add(id(cue))
+        if cue.audio_path:
+            cue.audio_path = _resolve_stored_path(cue.audio_path, root)
+
+
+def _relativize_cue_payload(cues, root: Path) -> None:
+    for raw in cues or []:
+        if isinstance(raw, dict) and raw.get("audio_path"):
+            raw["audio_path"] = _relative_media_path(str(raw["audio_path"]), root)
 
 
 def _resolve_stored_path(stored: str, root: Path) -> str:
@@ -484,6 +531,9 @@ def load_project(path: str | Path) -> Project:
     for clip in project.clips:
         if clip.path:
             clip.path = _resolve_stored_path(clip.path, root)
+    for narration in project.narrations.values():
+        _resolve_cue_audio(narration.cues, root)
+    _resolve_cue_audio(project.cues, root)
     if project.music_path:
         project.music_path = _resolve_stored_path(project.music_path, root)
     return project
@@ -506,18 +556,24 @@ def save_project(project: Project, path: str | Path | None = None) -> tuple[Path
     root.mkdir(parents=True, exist_ok=True)
     originals = [clip.path for clip in project.clips]
     music_original = project.music_path
+    audio_before = _cue_audio_snapshot(project)
     missing = collect_media(project, root)
     payload = project.to_dict()
     for raw, clip in zip(payload["clips"], project.clips):
         raw["path"] = "" if clip.is_pause else _relative_media_path(clip.path, root)
     if payload.get("music_path"):
         payload["music_path"] = _relative_media_path(str(payload["music_path"]), root)
+    _relativize_cue_payload(payload.get("cues"), root)
+    for narration in (payload.get("narrations") or {}).values():
+        _relativize_cue_payload(narration.get("cues"), root)
     try:
         json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception:
         for clip, old in zip(project.clips, originals):
             clip.path = old
         project.music_path = music_original
+        for cue, old in audio_before:
+            cue.audio_path = old
         raise
     project.path = str(json_path.resolve())
     for original, clip in zip(originals, project.clips):
