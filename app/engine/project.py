@@ -199,7 +199,7 @@ class Project:
     mark_out: float | None = None
     blurs: list[BlurRegion] = field(default_factory=list)
     pauses: list[Pause] = field(default_factory=list)
-    burn_subtitles: bool = True
+    burn_subtitles: bool = False
     speed: float = 1.0
     path: str | None = None
 
@@ -315,7 +315,7 @@ class Project:
             mark_out=data.get("mark_out"),
             blurs=blurs,
             pauses=[],
-            burn_subtitles=bool(data.get("burn_subtitles", True)),
+            burn_subtitles=bool(data.get("burn_subtitles", False)),
             speed=clamp_speed(data.get("speed", 1.0)),
             path=path,
         )

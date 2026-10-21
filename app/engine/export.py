@@ -31,6 +31,50 @@ def _even(value: int) -> int:
     return value if value % 2 == 0 else value + 1
 
 
+DIP_SECONDS = 0.2
+_CUT_GAP = 0.08
+
+
+def _picture_jump(left: Clip, right: Clip) -> bool:
+    """True when two neighbors are a real cut, not a pause or a continuous split."""
+    if left.is_pause or right.is_pause:
+        return False
+    if not left.path or not right.path:
+        return False
+    if left.path != right.path:
+        return True
+    return abs(float(left.out_point) - float(right.in_point)) > _CUT_GAP
+
+
+def _dip_lengths(duration: float, fade_in: bool, fade_out: bool) -> tuple[float, float]:
+    d_in = DIP_SECONDS if fade_in else 0.0
+    d_out = DIP_SECONDS if fade_out else 0.0
+    room = max(0.0, float(duration) - 0.04)
+    total = d_in + d_out
+    if total > room and total > 0:
+        scale = room / total
+        d_in *= scale
+        d_out *= scale
+    if d_in < 0.04:
+        d_in = 0.0
+    if d_out < 0.04:
+        d_out = 0.0
+    return d_in, d_out
+
+
+def _fade_suffix(duration: float, fade_in: bool, fade_out: bool, *, audio: bool = False) -> str:
+    d_in, d_out = _dip_lengths(duration, fade_in, fade_out)
+    name = "afade" if audio else "fade"
+    parts: list[str] = []
+    if d_in > 0:
+        parts.append(f"{name}=t=in:st=0:d={d_in:.3f}")
+    if d_out > 0:
+        parts.append(f"{name}=t=out:st={max(0.0, duration - d_out):.3f}:d={d_out:.3f}")
+    if not parts:
+        return ""
+    return "," + ",".join(parts)
+
+
 def concat_clips(clips: list[Clip], dest: Path, mute: bool = True, on_progress=None) -> Path:
     if not clips:
         raise ValueError("Add at least one video clip before exporting.")
@@ -99,23 +143,28 @@ def concat_clips(clips: list[Clip], dest: Path, mute: bool = True, on_progress=N
         start = max(0.0, clip.in_point)
         end = max(start + 0.04, clip.out_point)
         duration = max(0.04, end - start)
+        fade_in = index > 0 and _picture_jump(clips[index - 1], clip)
+        fade_out = index + 1 < len(clips) and _picture_jump(clip, clips[index + 1])
+        video_fade = _fade_suffix(duration, fade_in, fade_out)
         if clip.is_image:
             filters.append(
                 f"[{slot}:v]loop=-1:size=1,trim=duration={duration:.3f},"
-                f"setpts=PTS-STARTPTS,{scale}[v{index}]"
+                f"setpts=PTS-STARTPTS,{scale}{video_fade}[v{index}]"
             )
         else:
             filters.append(
                 f"[{slot}:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
-                f"{scale}[v{index}]"
+                f"{scale}{video_fade}[v{index}]"
             )
         concat_v.append(f"[v{index}]")
         if not mute:
             info = media_info(clip.path)
             if info["has_audio"] and not clip.is_image:
+                audio_fade = _fade_suffix(duration, fade_in, fade_out, audio=True)
                 filters.append(
                     f"[{slot}:a]atrim=start={start:.3f}:end={end:.3f},"
-                    f"asetpts=PTS-STARTPTS,aresample=44100,aformat=channel_layouts=stereo[a{index}]"
+                    f"asetpts=PTS-STARTPTS,aresample=44100,"
+                    f"aformat=channel_layouts=stereo{audio_fade}[a{index}]"
                 )
             else:
                 filters.append(
@@ -684,7 +733,7 @@ def export_project(
     picture = held
     caption_srt = work / "captions.srt"
     write_srt(caption_srt, plan, rate=1.0)
-    if getattr(project, "burn_subtitles", True) and caption_srt.read_text(encoding="utf-8").strip():
+    if getattr(project, "burn_subtitles", False) and caption_srt.read_text(encoding="utf-8").strip():
         emit("Burning subtitles…", percent_start + span * 0.58)
         captioned = work / "captioned.mp4"
         apply_captions(

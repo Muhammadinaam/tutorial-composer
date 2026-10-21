@@ -412,7 +412,7 @@ class MainWindow(QMainWindow):
             "The recording file still keeps that audio."
         )
         self.subs_box = QCheckBox("Burn subtitles")
-        self.subs_box.setChecked(True)
+        self.subs_box.setChecked(False)
         self.subs_box.setToolTip(
             "Draw each spoken line on the exported video. A .srt file is always saved next to the MP4."
         )
