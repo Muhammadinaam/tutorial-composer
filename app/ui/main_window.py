@@ -1309,6 +1309,7 @@ class MainWindow(QMainWindow):
     def _refresh_transport(self) -> None:
         if self._audio_hold:
             self.playhead = self._hold_at
+        if self._audio_hold or self._video_frozen:
             if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
                 self.player.pause()
         total = max(joined_duration(self.project.clips), 0.0)
@@ -2133,6 +2134,8 @@ class MainWindow(QMainWindow):
         total = joined_duration(self.project.clips)
         if self.playhead >= total:
             self.playhead = total
+            if self._hold_voice_past_end():
+                return
             self._pause_all()
             self._refresh_transport()
             return
@@ -2153,7 +2156,13 @@ class MainWindow(QMainWindow):
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self._joining = False
             clip = self.current_clip()
-            if self._audio_hold or self._waiting_for_voice or self._pause_holding or (clip and clip.is_pause):
+            if (
+                self._audio_hold
+                or self._waiting_for_voice
+                or self._video_frozen
+                or self._pause_holding
+                or (clip and clip.is_pause)
+            ):
                 self.player.pause()
             return
         if self._audio_hold or self._waiting_for_voice or self._video_frozen or self._pause_holding or self._scrubbing or self._joining or self._seeking:
@@ -2177,6 +2186,8 @@ class MainWindow(QMainWindow):
         nxt = self.selected_index + 1
         if nxt >= len(self.project.clips):
             self.playhead = joined_duration(self.project.clips)
+            if self._hold_voice_past_end():
+                return
             self._pause_all()
             self._refresh_transport()
             return
@@ -2282,9 +2293,12 @@ class MainWindow(QMainWindow):
     def _cue_index_at(self, moment: float, lead: float = 0.0) -> int | None:
         if not self.plan or len(self.tts_paths) != len(self.plan.cues):
             return None
-        # A long line's window can still cover a later line's start. The later
-        # line is the one that should play; falling back restarts the earlier clip.
-        # Finished lines stay skipped so a Stop-video hold cannot jump backward.
+        # A line that is still being spoken keeps the playhead. The next line
+        # starts only after this one finishes, which is also when export moves on.
+        # Finished lines stay skipped so a hold cannot jump backward.
+        active = self._speaking_cue_index(moment)
+        if active is not None:
+            return active
         found = None
         for index, cue in enumerate(self.plan.cues):
             if index <= self._narration_finished:
@@ -2450,7 +2464,104 @@ class MainWindow(QMainWindow):
         if self._pause_holding:
             self._end_pause_hold(resume=True)
 
-    def _begin_video_freeze(self, index: int, audio_elapsed: float = 0.0) -> None:
+    def _speaking_cue_index(self, moment: float) -> int | None:
+        """Cue that is still being spoken, even when the next cue's start is already here."""
+        if not self.plan:
+            return None
+        index = self._narration_index
+        resume = self._voice_resume
+        if index < 0 and resume:
+            index = resume[0]
+        if index < 0 or index >= len(self.plan.cues) or index <= self._narration_finished:
+            return None
+        speaking = (
+            self._voice_is_audible()
+            or self._waiting_for_voice
+            or self._sfx_play_when_ready
+            or (self._video_frozen and self._freeze_index == index)
+            or (resume is not None and resume[0] == index)
+        )
+        if not speaking:
+            return None
+        cue = self.plan.cues[index]
+        end = float(cue.video_time) + max(0.05, float(cue.tts_duration))
+        if moment < end - 0.04 and moment + 0.05 >= float(cue.video_time):
+            return index
+        return None
+
+    def _overlap_hold_point(self, index: int) -> float | None:
+        """Source time where export freezes so this line can finish before the next."""
+        if not self.plan or index < 0 or index >= len(self.plan.cues):
+            return None
+        if self._cue_wants_stop(index):
+            return None
+        cue = self.plan.cues[index]
+        if float(cue.hold) <= 0.05:
+            return None
+        point = float(cue.video_time) + max(0.0, float(cue.gap))
+        source = float(self.plan.source_duration or 0.0)
+        if source > 0.05:
+            point = min(point, source)
+        return point
+
+    def _freeze_if_voice_overlaps(self, index: int, *, starting: bool = False, elapsed: float | None = None) -> None:
+        hold_at = self._overlap_hold_point(index)
+        if hold_at is None or not self._playing:
+            return
+        speaking = (
+            starting
+            or self._voice_is_audible()
+            or self._waiting_for_voice
+            or self._sfx_play_when_ready
+        )
+        if not speaking:
+            return
+        if self.playhead + 0.03 < hold_at:
+            return
+        if elapsed is None:
+            if self.voice_sfx.isPlaying():
+                elapsed = self.voice_sfx.position_seconds()
+            else:
+                saved = self._voice_resume
+                cue = self.plan.cues[index]
+                elapsed = (
+                    saved[1]
+                    if saved and saved[0] == index
+                    else max(0.0, self.playhead - float(cue.video_time))
+                )
+        self._begin_video_freeze(index, elapsed, keep_place=True)
+
+    def _pin_held_frame(self, at: float) -> None:
+        total = max(0.0, joined_duration(self.project.clips))
+        self.playhead = min(max(0.0, at), total) if total else max(0.0, at)
+        mapped = map_joined_to_clip(self.project.clips, self.playhead)
+        if mapped:
+            self.selected_index = mapped[2]
+        clip = self.current_clip()
+        if clip and not clip.is_image and not clip.is_pause and self.selected_index >= 0:
+            start = clip_joined_start(self.project.clips, self.selected_index)
+            local_ms = int((clip.in_point + max(0.0, self.playhead - start)) * 1000)
+            if abs(self.player.position() - local_ms) > 120:
+                self._begin_seek(local_ms, 200)
+                self.player.setPosition(local_ms)
+        self.player.pause()
+        self._image_clock.stop()
+
+    def _hold_voice_past_end(self) -> bool:
+        """Keep the last frame while a line that runs past the video is still speaking."""
+        index = self._narration_index
+        if index < 0 or not self._playing or not self._voice_is_audible():
+            return False
+        if self._overlap_hold_point(index) is None:
+            return False
+        self._freeze_if_voice_overlaps(index)
+        if not self._video_frozen:
+            return False
+        self._refresh_transport()
+        self._sync_music()
+        return True
+
+    def _begin_video_freeze(self, index: int, audio_elapsed: float = 0.0, *, keep_place: bool = False) -> None:
         if self._video_frozen and self._freeze_index == index:
             return
         if self._video_frozen and self._freeze_clock:
@@ -2463,7 +2574,12 @@ class MainWindow(QMainWindow):
         if self.plan and 0 <= index < len(self.plan.cues):
             cue = self.plan.cues[index]
             duration = cue.tts_duration
-            if elapsed <= 0.04:
+            if keep_place:
+                hold_at = float(cue.video_time) + max(0.0, float(cue.gap))
+                if self._audio_hold:
+                    self._hold_at = hold_at
+                self._pin_held_frame(hold_at)
+            elif elapsed <= 0.04:
                 self.playhead = cue.video_time
         self.player.pause()
         self._image_clock.stop()
@@ -2471,14 +2587,23 @@ class MainWindow(QMainWindow):
         remaining = max(0.2, duration - elapsed)
         self._freeze_timer.start(int((remaining + 0.6) * 1000))
 
-    def _end_video_freeze(self, resume: bool = True) -> None:
+    def _end_video_freeze(self, resume: bool = True, *, sync: bool = False) -> None:
         if not self._video_frozen:
             self._freeze_timer.stop()
             return
         if self._freeze_clock:
             self._music_lead += self._freeze_media_elapsed()
         self._discard_video_freeze()
-        if resume and self._playing and not self._scrubbing and not self._audio_hold:
+        if sync and self._playing and not self._scrubbing:
+            self._sync_narration()
+        if (
+            resume
+            and self._playing
+            and not self._scrubbing
+            and not self._audio_hold
+            and not self._waiting_for_voice
+            and not self._video_frozen
+        ):
             self._resume_transport()
 
     def _freeze_timeout(self) -> None:
@@ -2490,7 +2615,7 @@ class MainWindow(QMainWindow):
         if self._narration_index >= 0:
             self._narration_finished = self._narration_index
             self._narration_index = -1
-        self._end_video_freeze(resume=True)
+        self._end_video_freeze(resume=True, sync=True)
 
     def _hold_transport(self, at: float) -> None:
         self._audio_hold = True
@@ -2591,7 +2716,7 @@ class MainWindow(QMainWindow):
         self._waiting_for_voice = False
         self._audio_hold = False
         if self._video_frozen and (self._freeze_index == finished or finished < 0):
-            self._end_video_freeze(resume=True)
+            self._end_video_freeze(resume=True, sync=True)
         elif held and self._playing and not self._scrubbing:
             self._resume_transport()
 
@@ -2615,9 +2740,9 @@ class MainWindow(QMainWindow):
         index = self._narration_index
         if index < 0 or not self.voice_sfx.isPlaying():
             return
-        # A freeze keeps the playhead on the cue start while speech continues,
-        # so the sample position is the only place Play can resume from.
-        if self._cue_wants_stop(index):
+        # A freeze pins the playhead while speech continues, so Play resumes
+        # from the sample position rather than the held frame.
+        if self._cue_wants_stop(index) or self._video_frozen:
             self._voice_resume = (index, self.voice_sfx.position_seconds())
             return
         self._voice_resume = None
@@ -2628,10 +2753,11 @@ class MainWindow(QMainWindow):
         cue = self.plan.cues[index]
         into = max(0.0, self.playhead - float(cue.video_time))
         saved = self._voice_resume
-        if saved and saved[0] == index and self._cue_wants_stop(index) and into < 0.12:
-            return max(0.0, saved[1])
-        if saved and saved[0] == index and abs(into - saved[1]) > 0.25:
-            self._voice_resume = None
+        if saved and saved[0] == index:
+            if (self._cue_wants_stop(index) and into < 0.12) or saved[1] > into + 0.12:
+                return max(0.0, saved[1])
+            if abs(into - saved[1]) > 0.25:
+                self._voice_resume = None
         return into
 
     def _start_narration(self, index: int, play: bool, offset: float = 0.0) -> None:
@@ -2676,6 +2802,7 @@ class MainWindow(QMainWindow):
             and due == self._narration_index
             and (audible or self._waiting_for_voice or self._sfx_play_when_ready)
         ):
+            self._freeze_if_voice_overlaps(due)
             return
         if due is None:
             if audible and not force and self._playing:
@@ -2702,14 +2829,20 @@ class MainWindow(QMainWindow):
         elif self._video_frozen:
             self._end_video_freeze(resume=False)
         if not force and due == self._narration_index and (audible or self._waiting_for_voice):
+            self._freeze_if_voice_overlaps(due)
             return
         if offset <= 0.04:
             self.playhead = cue_time
             hold_at = cue_time
         else:
             hold_at = self.playhead
+        overlap_at = self._overlap_hold_point(due)
+        if overlap_at is not None and hold_at + 0.03 >= overlap_at:
+            hold_at = overlap_at
+            self.playhead = overlap_at
         self._voice_resume = None
         self._hold_transport(hold_at)
+        self._freeze_if_voice_overlaps(due, starting=True, elapsed=offset)
         self._start_narration(due, True, offset)
 
     def _retry_narration(self) -> None:
