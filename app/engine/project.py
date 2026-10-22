@@ -29,6 +29,7 @@ class Clip:
     duration: float = 0.0
     id: str = field(default_factory=new_id)
     kind: str = "video"
+    source_id: str = ""
 
     @property
     def used(self) -> float:
@@ -92,6 +93,34 @@ class Pause:
     def clamp(self) -> None:
         self.at = max(0.0, float(self.at))
         self.duration = max(0.2, min(30.0, float(self.duration)))
+
+
+def source_to_composed(moment: float, pauses: list[Pause]) -> float:
+    """Map a shared-video time onto a timeline that includes ``pauses``."""
+    moment = max(0.0, float(moment))
+    extra = 0.0
+    for pause in sorted(pauses, key=lambda item: (float(item.at), item.id)):
+        if float(pause.at) < moment - 0.0005:
+            extra += float(pause.duration)
+        else:
+            break
+    return moment + extra
+
+
+def composed_to_source(moment: float, pauses: list[Pause]) -> float:
+    """Map a timeline time that includes pauses back onto the shared video."""
+    remaining = max(0.0, float(moment))
+    cursor = 0.0
+    for pause in sorted(pauses, key=lambda item: (float(item.at), item.id)):
+        gap = max(0.0, float(pause.at) - cursor)
+        if remaining <= gap + 0.0005:
+            return cursor + remaining
+        remaining -= gap
+        cursor = float(pause.at)
+        if remaining <= float(pause.duration) + 0.0005:
+            return cursor
+        remaining -= float(pause.duration)
+    return cursor + remaining
 
 
 def clamp_speed(value: float) -> float:
@@ -158,6 +187,7 @@ class Narration:
     voice: str = "en-US-JennyNeural"
     cues: list[Cue] = field(default_factory=list)
     highlights: list[BlurRegion] = field(default_factory=list)
+    pauses: list[Pause] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -165,6 +195,7 @@ class Narration:
             "voice": self.voice,
             "cues": [asdict(c) for c in self.cues],
             "highlights": [item.to_dict() for item in self.highlights],
+            "pauses": [item.to_dict() for item in self.pauses],
         }
 
     @classmethod
@@ -174,11 +205,16 @@ class Narration:
         for raw in data.get("highlights") or []:
             if isinstance(raw, dict):
                 highlights.append(BlurRegion.from_dict(raw))
+        pauses = []
+        for raw in data.get("pauses") or []:
+            if isinstance(raw, dict):
+                pauses.append(Pause.from_dict(raw))
         return cls(
             lang=data.get("lang", "en"),
             voice=data.get("voice", "en-US-JennyNeural"),
             cues=cues,
             highlights=highlights,
+            pauses=pauses,
         )
 
 
@@ -217,8 +253,21 @@ class Project:
         return self.narrations[self.lang]
 
     def regions(self) -> list[BlurRegion]:
-        """Shared blurs plus the highlight boxes for the current language."""
-        return [*self.blurs, *self.current().highlights]
+        """Blurs and highlights on the open language's timeline.
+
+        Blurs are stored on the shared video. Their times are shifted forward
+        by the pauses that sit before them. Highlights already use this tab's time.
+        """
+        pauses = self.current().pauses
+        viewed: list[BlurRegion] = []
+        for blur in self.blurs:
+            start = source_to_composed(blur.start, pauses)
+            end = source_to_composed(blur.end, pauses)
+            if end < start + 0.08:
+                end = start + 0.08
+            viewed.append(replace(blur, start=start, end=end))
+        viewed.extend(self.current().highlights)
+        return viewed
 
     def sync_from_current(self) -> None:
         current = self.current()
@@ -228,8 +277,15 @@ class Project:
 
     def to_dict(self) -> dict:
         self.sync_from_current()
+        if any(clip.is_pause for clip in self.clips):
+            from app.engine.edl import extract_pauses
+
+            source, pauses = extract_pauses(self.clips)
+            self.current().pauses = pauses
+        else:
+            source = [replace(clip, source_id="") for clip in self.clips]
         return {
-            "clips": [asdict(c) for c in self.clips],
+            "clips": [_clip_payload(clip) for clip in source],
             "mute_original": self.mute_original,
             "script_text": self.script_text,
             "cues": [asdict(c) for c in self.cues],
@@ -243,7 +299,6 @@ class Project:
             "mark_in": self.mark_in,
             "mark_out": self.mark_out,
             "blurs": [blur.to_dict() for blur in self.blurs],
-            "pauses": [pause.to_dict() for pause in self.pauses],
             "burn_subtitles": self.burn_subtitles,
             "speed": clamp_speed(self.speed),
         }
@@ -254,6 +309,7 @@ class Project:
         for raw in data.get("clips", []):
             item = dict(raw)
             item.setdefault("kind", "image" if _looks_image(item.get("path", "")) else "video")
+            item.pop("source_id", None)
             clips.append(Clip(**item))
         cues = [Cue.from_dict(c) if isinstance(c, dict) else c for c in data.get("cues", [])]
         narrations = {}
@@ -294,12 +350,26 @@ class Project:
         for raw in data.get("pauses") or []:
             if isinstance(raw, dict):
                 legacy_pauses.append(Pause.from_dict(raw))
-        if legacy_pauses and clips:
-            from app.engine.edl import insert_pause
+        had_clip_pauses = any(clip.is_pause for clip in clips)
+        extracted: list[Pause] = []
+        if had_clip_pauses:
+            from app.engine.edl import extract_pauses
 
-            for old in sorted(legacy_pauses, key=lambda item: -float(item.at)):
-                clips = insert_pause(clips, old.at, old.duration)
-        return cls(
+            clips, extracted = extract_pauses(clips, join_legacy=True)
+        stored_pauses = any(item.pauses for item in narrations.values())
+        if not stored_pauses:
+            seeded = extracted or legacy_pauses
+            if seeded and narrations:
+                for narration in narrations.values():
+                    narration.pauses = [replace(pause, id=new_id()) for pause in seeded]
+                if had_clip_pauses:
+                    for blur in blurs:
+                        blur.start = composed_to_source(blur.start, seeded)
+                        blur.end = composed_to_source(blur.end, seeded)
+                        if blur.end < blur.start + 0.08:
+                            blur.end = blur.start + 0.08
+                        blur.clamp()
+        project = cls(
             clips=clips,
             mute_original=bool(data.get("mute_original", True)),
             script_text=data.get("script_text", ""),
@@ -319,6 +389,16 @@ class Project:
             speed=clamp_speed(data.get("speed", 1.0)),
             path=path,
         )
+        from app.engine.edl import compose_clips
+
+        project.clips = compose_clips(project.clips, project.current().pauses)
+        return project
+
+
+def _clip_payload(clip: Clip) -> dict:
+    data = asdict(clip)
+    data.pop("source_id", None)
+    return data
 
 
 def media_dir_for(project_json: str | Path) -> Path:
@@ -559,8 +639,11 @@ def save_project(project: Project, path: str | Path | None = None) -> tuple[Path
     audio_before = _cue_audio_snapshot(project)
     missing = collect_media(project, root)
     payload = project.to_dict()
-    for raw, clip in zip(payload["clips"], project.clips):
-        raw["path"] = "" if clip.is_pause else _relative_media_path(clip.path, root)
+    for raw in payload["clips"]:
+        if raw.get("kind") == "pause" or not raw.get("path"):
+            raw["path"] = ""
+        else:
+            raw["path"] = _relative_media_path(str(raw["path"]), root)
     if payload.get("music_path"):
         payload["music_path"] = _relative_media_path(str(payload["music_path"]), root)
     _relativize_cue_payload(payload.get("cues"), root)

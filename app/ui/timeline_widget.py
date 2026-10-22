@@ -655,6 +655,14 @@ class TimelineWidget(QScrollArea):
     def set_state(self, *args, **kwargs) -> None:
         self.canvas.set_state(*args, **kwargs)
 
+    def region_by_id(self, region_id: str):
+        if not region_id:
+            return None
+        for region in self.canvas.blurs:
+            if region.id == region_id:
+                return region
+        return None
+
     def set_playhead(self, seconds: float) -> None:
         self.canvas.set_playhead(seconds)
         if self.follow_playhead:

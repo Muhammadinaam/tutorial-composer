@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from time import monotonic
 
@@ -41,7 +42,9 @@ from PySide6.QtWidgets import (
 from app.engine.capture import CaptureRegion, CaptureRequest, ScreenRecorder, even, new_recording_path
 from app.engine.edl import (
     clip_joined_start,
+    compose_clips,
     delete_joined_range,
+    extract_pauses,
     joined_duration,
     map_joined_to_clip,
     probe_audio,
@@ -50,11 +53,13 @@ from app.engine.edl import (
     remap_blurs,
     remap_cues,
     remap_joined_time,
-    remap_pauses,
+    remap_source_pauses,
+    remap_source_regions,
     reorder_clip,
     ripple_blurs,
     ripple_cues,
     ripple_pauses,
+    same_source_clips,
     split_clip,
 )
 from app.engine.history import EditHistory
@@ -69,6 +74,8 @@ from app.engine.project import (
     Project,
     clamp_speed,
     clone_region,
+    composed_to_source,
+    source_to_composed,
     is_project_bundle,
     load_project,
     media_dir_for,
@@ -263,6 +270,7 @@ class MainWindow(QMainWindow):
         self._selected_blur_id = ""
         self._selected_pause_id = ""
         self._selected_cue = -1
+        self._edit_source: list | None = None
         self._pause_holding = False
         self._pause_hold_id = ""
         self._pause_at = 0.0
@@ -574,8 +582,9 @@ class MainWindow(QMainWindow):
         self.split_btn.setToolTip("Cut the selected video or voice at the red playhead (S)")
         self.pause_btn = QPushButton("Add pause")
         self.pause_btn.setToolTip(
-            "Split the picture at the playhead and insert a frozen frame. V1 gets longer. "
-            "Narration stays where it is. Drag the pause's right edge to change its length."
+            "Freeze the picture at the playhead for this language only. "
+            "Other language tabs keep their own timing. "
+            "Drag the pause's right edge to change its length."
         )
         self.highlight_btn = QPushButton("Highlight")
         self.highlight_btn.setCheckable(True)
@@ -661,7 +670,7 @@ class MainWindow(QMainWindow):
         self.timeline.setToolTip(
             "Drag a video to change its order. Drag a narration line to change when it starts. "
             "Click a block, then Delete to remove it. Drag the edges of a clip to trim. "
-            "A pause is a block on V1. Drag its right edge to change how long the picture holds. "
+            "A pause is a block on V1 for this language. Drag its right edge to change how long the picture holds. "
             "Drag the red line, or empty track, to scrub."
         )
         tl_box.addWidget(self.timeline)
@@ -1405,6 +1414,7 @@ class MainWindow(QMainWindow):
         self._finish_user_seek(seconds)
 
     def _after_trim(self) -> None:
+        self._sync_open_pauses()
         self.refresh_warnings()
         self._refresh_transport()
         self.refresh_timeline()
@@ -1419,16 +1429,161 @@ class MainWindow(QMainWindow):
     def _begin_edit(self) -> None:
         if self._restoring:
             return
+        if self._edit_source is None:
+            source, _pauses = extract_pauses(self.project.clips)
+            self._edit_source = [replace(clip) for clip in source]
         if self._history.pending is None and (self._playing or self._warming):
             self._pause_all()
         self._history.begin(self._snapshot())
 
     def _commit_edit(self) -> None:
         if self._restoring:
+            self._edit_source = None
             self._history.cancel()
             return
+        self._sync_open_pauses()
+        self._edit_source = None
         self._history.commit(self._snapshot())
         self._update_history_buttons()
+
+    def _cancel_edit(self) -> None:
+        self._edit_source = None
+        self._history.cancel()
+
+    def _sync_open_pauses(self) -> None:
+        _source, pauses = extract_pauses(self.project.clips)
+        self.project.current().pauses = pauses
+
+    def _finish_source_shift(self) -> None:
+        old_source = self._edit_source
+        self._edit_source = None
+        _source, pauses = extract_pauses(self.project.clips)
+        self.project.current().pauses = pauses
+        if not old_source:
+            return
+        new_source, _pauses = extract_pauses(self.project.clips)
+        if same_source_clips(old_source, new_source):
+            return
+        self.project.blurs = remap_source_regions(old_source, new_source, self.project.blurs)
+        for code, narration in self.project.narrations.items():
+            if code == self.project.lang:
+                continue
+            self._shift_narration_frames(narration, old_source, new_source)
+
+    def _shift_narration_frames(self, narration: Narration, old_source: list, new_source: list) -> None:
+        from app.engine.edl import locate_source_frame
+
+        old_pauses = list(narration.pauses)
+        kept_cues = []
+        cue_sources = []
+        for cue in narration.cues:
+            source_t = composed_to_source(cue.video_time, old_pauses)
+            moved = locate_source_frame(old_source, new_source, source_t)
+            if moved is None:
+                continue
+            kept_cues.append(cue)
+            cue_sources.append(moved)
+        highlight_sources = []
+        for region in narration.highlights:
+            start = locate_source_frame(
+                old_source, new_source, composed_to_source(region.start, old_pauses)
+            )
+            end = locate_source_frame(
+                old_source, new_source, composed_to_source(region.end, old_pauses)
+            )
+            if start is None and end is None:
+                continue
+            if start is None:
+                start = end
+            if end is None:
+                end = start
+            if start is None or end is None:
+                continue
+            if end < start:
+                start, end = end, start
+            highlight_sources.append((region, start, end))
+        narration.pauses = remap_source_pauses(old_source, new_source, old_pauses)
+        narration.cues = [
+            replace(cue, video_time=source_to_composed(moment, narration.pauses))
+            for cue, moment in zip(kept_cues, cue_sources)
+        ]
+        highlights = []
+        for region, start, end in highlight_sources:
+            view_start = source_to_composed(start, narration.pauses)
+            view_end = source_to_composed(end, narration.pauses)
+            if view_end < view_start + 0.08:
+                view_end = view_start + 0.08
+            updated = replace(region, start=view_start, end=view_end)
+            updated.clamp()
+            highlights.append(updated)
+        narration.highlights = highlights
+
+    def _ripple_other_languages(self, src_lo: float, src_hi: float) -> None:
+        if src_hi - src_lo < 0.05:
+            return
+        self.project.blurs = ripple_blurs(self.project.blurs, src_lo, src_hi)
+        for code, narration in self.project.narrations.items():
+            if code == self.project.lang:
+                continue
+            old_pauses = list(narration.pauses)
+            narration.pauses = ripple_pauses(narration.pauses, src_lo, src_hi)
+            narration.cues = self._ripple_cues_on_source(
+                narration.cues, old_pauses, narration.pauses, src_lo, src_hi
+            )
+            narration.highlights = self._ripple_highlights_on_source(
+                narration.highlights, old_pauses, narration.pauses, src_lo, src_hi
+            )
+
+    def _ripple_cues_on_source(self, cues, old_pauses, new_pauses, src_lo: float, src_hi: float):
+        result = []
+        gap = src_hi - src_lo
+        for cue in cues:
+            source_t = composed_to_source(cue.video_time, old_pauses)
+            if src_lo + 0.001 <= source_t < src_hi - 0.001:
+                continue
+            if source_t >= src_hi - 0.001:
+                source_t = max(0.0, source_t - gap)
+            result.append(replace(cue, video_time=source_to_composed(source_t, new_pauses)))
+        result.sort(key=lambda item: item.video_time)
+        return result
+
+    def _ripple_highlights_on_source(self, highlights, old_pauses, new_pauses, src_lo: float, src_hi: float):
+        as_source = []
+        for region in highlights:
+            start = composed_to_source(region.start, old_pauses)
+            end = composed_to_source(region.end, old_pauses)
+            if end < start + 0.08:
+                end = start + 0.08
+            as_source.append(replace(region, start=start, end=end))
+        rippled = ripple_blurs(as_source, src_lo, src_hi)
+        viewed = []
+        for region in rippled:
+            start = source_to_composed(region.start, new_pauses)
+            end = source_to_composed(region.end, new_pauses)
+            if end < start + 0.08:
+                end = start + 0.08
+            updated = replace(region, start=start, end=end)
+            updated.clamp()
+            viewed.append(updated)
+        return viewed
+
+    def _highlights_on_shared_frames(self, highlights, from_pauses) -> list[BlurRegion]:
+        cloned = []
+        for item in highlights:
+            start = composed_to_source(item.start, from_pauses)
+            end = composed_to_source(item.end, from_pauses)
+            if end < start + 0.08:
+                end = start + 0.08
+            region = clone_region(item)
+            region.start = start
+            region.end = end
+            region.clamp()
+            cloned.append(region)
+        return cloned
+
+    def _map_cue_to_pauses(self, cue: Cue, from_pauses, to_pauses) -> Cue:
+        source_t = composed_to_source(cue.video_time, from_pauses)
+        return replace(cue, video_time=source_to_composed(source_t, to_pauses))
 
     def _update_history_buttons(self) -> None:
         self.undo_btn.setEnabled(self._history.can_undo())
@@ -1505,6 +1660,7 @@ class MainWindow(QMainWindow):
         elif not cue_drag:
             self._refresh_transport()
             self.refresh_timeline()
+        self._finish_source_shift()
         self._commit_edit()
 
     def _on_clip_reordered(self, clip_id: str, dest: int) -> None:
@@ -1523,18 +1679,25 @@ class MainWindow(QMainWindow):
         self.refresh_timeline()
 
     def _remap_project_times(self, old: list, new: list) -> None:
-        for narration in self.project.narrations.values():
-            narration.cues = remap_cues(old, new, narration.cues)
-        self.project.blurs = remap_blurs(old, new, self.project.blurs)
-        for narration in self.project.narrations.values():
-            narration.highlights = remap_blurs(old, new, narration.highlights)
-        self.project.pauses = remap_pauses(old, new, self.project.pauses)
+        code = self.project.lang
+        current = self.project.narrations.get(code) or self.project.current()
+        current.cues = remap_cues(old, new, current.cues)
+        current.highlights = remap_blurs(old, new, current.highlights)
+        old_source, _old_pauses = extract_pauses(old)
+        new_source, new_pauses = extract_pauses(new)
+        current.pauses = new_pauses
+        self.project.blurs = remap_source_regions(old_source, new_source, self.project.blurs)
+        for other_code, narration in self.project.narrations.items():
+            if other_code == code:
+                continue
+            self._shift_narration_frames(narration, old_source, new_source)
         if self.project.mark_in is not None:
             self.project.mark_in = remap_joined_time(old, new, self.project.mark_in)
         if self.project.mark_out is not None:
             self.project.mark_out = remap_joined_time(old, new, self.project.mark_out)
         self.project.sync_from_current()
         self._remap_stored_voices(new)
+        self._edit_source = None
 
     def _remap_stored_voices(self, clips: list) -> None:
         duration = joined_duration(clips)
@@ -1837,14 +2000,14 @@ class MainWindow(QMainWindow):
         if self._selected_pause_id:
             self._begin_edit()
             if not self._delete_selected_pause():
-                self._history.cancel()
+                self._cancel_edit()
                 return
             self._commit_edit()
             return
         if self._selected_blur_id:
             self._begin_edit()
             if not self._delete_selected_blur():
-                self._history.cancel()
+                self._cancel_edit()
                 return
             self._commit_edit()
             return
@@ -1858,13 +2021,19 @@ class MainWindow(QMainWindow):
         if index < 0 or index >= len(self.project.clips):
             return
         self._begin_edit()
+        removed = self.project.clips[index]
         del self.project.clips[index]
+        if removed.is_pause:
+            source, pauses = extract_pauses(self.project.clips)
+            self.project.current().pauses = pauses
+            self.project.clips = compose_clips(source, pauses)
         if not self.project.clips:
             self.selected_index = -1
             self.playhead = 0.0
         else:
             self.selected_index = min(index, len(self.project.clips) - 1)
             self.playhead = min(self.playhead, joined_duration(self.project.clips))
+        self._finish_source_shift()
         self.refresh_timeline()
         self.refresh_warnings()
         self._refresh_transport()
@@ -1886,7 +2055,7 @@ class MainWindow(QMainWindow):
         self._begin_edit()
         self.project.clips = split_clip(self.project.clips, index, local)
         if len(self.project.clips) == before:
-            self._history.cancel()
+            self._cancel_edit()
             self._set_status("Move the red line onto a clip, then Split.")
             return
         self.selected_index = index + 1
@@ -1944,7 +2113,7 @@ class MainWindow(QMainWindow):
                 if len(paths) == len(spoken):
                     paths[index:index + 1] = ["", ""]
         except Exception as exc:
-            self._history.cancel()
+            self._cancel_edit()
             self._set_status(str(exc))
             return
         right_start = original.video_time + left_dur
@@ -1994,6 +2163,7 @@ class MainWindow(QMainWindow):
         self._begin_edit()
         before = joined_duration(self.project.clips)
         self.project.clips = insert_pause(self.project.clips, self.playhead, 1.5)
+        self._sync_open_pauses()
         after = joined_duration(self.project.clips)
         mapped = map_joined_to_clip(self.project.clips, min(self.playhead, after))
         if mapped and mapped[0].is_pause:
@@ -2007,8 +2177,9 @@ class MainWindow(QMainWindow):
         self._show_current_media(force=True)
         self._commit_edit()
         grown = after - before
+        language = LANGUAGE_NAMES.get(self.project.lang, self.project.lang)
         self._set_status(
-            f"Inserted a {grown:.1f}s pause on V1. Narration times stay where they are. "
+            f"Inserted a {grown:.1f}s pause for {language}. Other languages are unchanged. "
             "Drag the pause's right edge to change its length."
         )
 
@@ -3085,20 +3256,36 @@ class MainWindow(QMainWindow):
 
     def _apply_language(self, code: str, save_current: bool = True) -> None:
         self._switching_lang = True
+        if self._playing or self._warming:
+            self._pause_all()
         if save_current and self.project.lang in self.project.narrations:
             self.project.current().cues = [c for c in self._cues_from_table() if c.text.strip()]
             self._save_tts()
-        source = self.project.current()
+        shared, pauses = extract_pauses(self.project.clips)
+        if self.project.lang in self.project.narrations:
+            self.project.narrations[self.project.lang].pauses = pauses
+        anchor = composed_to_source(self.playhead, pauses)
+        mark_in = None if self.project.mark_in is None else composed_to_source(self.project.mark_in, pauses)
+        mark_out = None if self.project.mark_out is None else composed_to_source(self.project.mark_out, pauses)
+        previous = self.project.narrations.get(self.project.lang)
         self.project.lang = code
         if code not in self.project.narrations:
             match = matching_voice(self.voices, code)
+            copied = previous.highlights if previous else []
             self.project.narrations[code] = Narration(
                 lang=code,
                 voice=match.id if match else self.project.voice,
-                highlights=[clone_region(item) for item in source.highlights],
+                highlights=self._highlights_on_shared_frames(copied, pauses),
             )
         current = self.project.current()
         self.project.voice = current.voice
+        self.project.clips = compose_clips(shared, current.pauses)
+        total = joined_duration(self.project.clips)
+        self.playhead = min(source_to_composed(anchor, current.pauses), total)
+        if mark_in is not None:
+            self.project.mark_in = min(source_to_composed(mark_in, current.pauses), total)
+        if mark_out is not None:
+            self.project.mark_out = min(source_to_composed(mark_out, current.pauses), total)
         self._restore_tts()
         self._load_cues_into_table()
         combo = self.lang_combo.findData(code)
@@ -3112,8 +3299,7 @@ class MainWindow(QMainWindow):
         self._switching_lang = False
         if self._selected_blur_id and self._selected_blur() is None:
             self._selected_blur_id = ""
-        self.refresh_timeline()
-        self._sync_preview_overlays()
+        self._seek_joined(self.playhead)
         self.refresh_warnings()
         self._persist_voice_prefs()
 
@@ -3251,19 +3437,26 @@ class MainWindow(QMainWindow):
         region.end = min(total, region.end)
         if region.end - region.start < 0.08:
             region.start = max(0.0, region.end - 0.08)
+        shown_start, shown_end = region.start, region.end
         if region.is_highlight():
             self.project.current().highlights.append(region)
         else:
+            pauses = self.project.current().pauses
+            region.start = composed_to_source(shown_start, pauses)
+            region.end = composed_to_source(shown_end, pauses)
+            if region.end < region.start + 0.08:
+                region.end = region.start + 0.08
+            region.clamp()
             self.project.blurs.append(region)
         self._selected_blur_id = region.id
-        if self.playhead < region.start - 0.001 or self.playhead > region.end + 0.001:
-            self._seek_joined(region.start)
+        if self.playhead < shown_start - 0.001 or self.playhead > shown_end + 0.001:
+            self._seek_joined(shown_start)
         else:
             self.refresh_timeline()
             self._sync_preview_overlays()
         word = "Highlight" if region.is_highlight() else "Blur"
         self._set_status(
-            f"{word} from {format_timestamp(region.start)} to {format_timestamp(region.end)}. "
+            f"{word} from {format_timestamp(shown_start)} to {format_timestamp(shown_end)}. "
             "Drag its bar on V1 to change the time."
         )
 
@@ -3322,7 +3515,31 @@ class MainWindow(QMainWindow):
         self._set_status("Pause removed.")
         return True
 
+    def _stored_region(self, region_id: str) -> BlurRegion | None:
+        for blur in self.project.blurs:
+            if blur.id == region_id:
+                return blur
+        for highlight in self.project.current().highlights:
+            if highlight.id == region_id:
+                return highlight
+        return None
+
+    def _write_blur_span(self, region: BlurRegion) -> None:
+        pauses = self.project.current().pauses
+        for blur in self.project.blurs:
+            if blur.id != region.id:
+                continue
+            blur.start = composed_to_source(region.start, pauses)
+            blur.end = composed_to_source(region.end, pauses)
+            if blur.end < blur.start + 0.08:
+                blur.end = blur.start + 0.08
+            blur.clamp()
+            return
+
     def _on_blur_edited(self) -> None:
+        region = self.timeline.region_by_id(self._selected_blur_id)
+        if region is not None and not region.is_highlight():
+            self._write_blur_span(region)
         self._sync_preview_overlays()
         blur = self._selected_blur()
         if blur:
@@ -3332,10 +3549,10 @@ class MainWindow(QMainWindow):
             )
 
     def _blur_rect_edited(self, blur_id: str, x: float, y: float, w: float, h: float) -> None:
-        for blur in self.project.regions():
-            if blur.id == blur_id:
-                blur.x, blur.y, blur.w, blur.h = x, y, w, h
-                break
+        stored = self._stored_region(blur_id)
+        if stored is not None:
+            stored.x, stored.y, stored.w, stored.h = x, y, w, h
+            stored.clamp()
         self._selected_blur_id = blur_id
         self._sync_preview_overlays()
 
@@ -3387,13 +3604,17 @@ class MainWindow(QMainWindow):
         before = len(self.project.clips)
         lo, hi = min(start, end), max(start, end)
         self._begin_edit()
+        _shared, old_pauses = extract_pauses(self.project.clips)
         self.project.clips = delete_joined_range(self.project.clips, lo, hi)
-        for narration in self.project.narrations.values():
-            narration.cues = ripple_cues(narration.cues, lo, hi)
-        self.project.blurs = ripple_blurs(self.project.blurs, lo, hi)
-        for narration in self.project.narrations.values():
-            narration.highlights = ripple_blurs(narration.highlights, lo, hi)
-        self.project.pauses = ripple_pauses(self.project.pauses, lo, hi)
+        current = self.project.current()
+        current.cues = ripple_cues(current.cues, lo, hi)
+        current.highlights = ripple_blurs(current.highlights, lo, hi)
+        _source, new_pauses = extract_pauses(self.project.clips)
+        current.pauses = new_pauses
+        src_lo = composed_to_source(lo, old_pauses)
+        src_hi = composed_to_source(hi, old_pauses)
+        self._ripple_other_languages(src_lo, src_hi)
+        self._edit_source = None
         if self._selected_blur_id and not self._selected_blur():
             self._selected_blur_id = ""
         if self._selected_pause_id and not self._selected_pause():
@@ -3460,7 +3681,7 @@ class MainWindow(QMainWindow):
             kind = "measured" if measured else "estimated"
             bits.append(f"No holds ({kind}). Speech fits the gaps.")
         if any(clip.is_pause for clip in self.project.clips):
-            bits.append("Pauses hold the picture on V1. Spoken lines stay at their times.")
+            bits.append("Pauses on this language hold the picture. Other languages keep their own timing.")
         ready_count = sum(1 for path in self.tts_paths if usable_audio(path))
         if ready_count:
             bits.append(f"{ready_count} voice clip(s) ready on the VO track.")
@@ -3693,18 +3914,22 @@ class MainWindow(QMainWindow):
     def _translated(self, result) -> None:
         self.translate_btn.setEnabled(True)
         target, cues = result
+        self._sync_open_pauses()
         match = matching_voice(self.voices, target)
         existing = self.project.narrations.get(target)
         source = self.project.current()
+        open_pauses = list(source.pauses)
+        target_pauses = list(existing.pauses) if existing else []
         self.project.narrations[target] = Narration(
             lang=target,
             voice=match.id if match else self.project.voice,
-            cues=cues,
+            cues=[self._map_cue_to_pauses(cue, open_pauses, target_pauses) for cue in cues],
             highlights=(
                 list(existing.highlights)
                 if existing
-                else [clone_region(item) for item in source.highlights]
+                else self._highlights_on_shared_frames(source.highlights, open_pauses)
             ),
+            pauses=target_pauses,
         )
         self._clear_tts(target)
         self._apply_language(target)
@@ -3732,7 +3957,26 @@ class MainWindow(QMainWindow):
 
         data = self.settings()
         voice = self.project.current().voice or self.project.voice
+        self._sync_open_pauses()
         source = joined_duration(self.project.clips)
+        frozen = replace(
+            self.project,
+            clips=[replace(clip) for clip in self.project.clips],
+            blurs=[replace(blur) for blur in self.project.blurs],
+            narrations={
+                code: (
+                    replace(
+                        item,
+                        pauses=[replace(pause) for pause in item.pauses],
+                        highlights=list(item.highlights),
+                        cues=list(item.cues),
+                    )
+                    if code == self.project.lang
+                    else item
+                )
+                for code, item in self.project.narrations.items()
+            },
+        )
         existing_paths = list(self.tts_paths)
         existing_durs = list(self.tts_durations)
         voices_ready = (
@@ -3775,7 +4019,7 @@ class MainWindow(QMainWindow):
             plan = self._make_plan(cues, durations, source) if cues else self._make_plan([], [], source)
             progress("Rendering video with FFmpeg...", voice_end)
             export_project(
-                self.project,
+                frozen,
                 plan,
                 paths,
                 dest,

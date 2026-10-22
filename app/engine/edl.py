@@ -73,15 +73,25 @@ def clip_joined_start(clips: list[Clip], index: int) -> float:
     return sum(c.used for c in clips[:index])
 
 
-def make_pause(duration: float = 1.5) -> Clip:
+def make_pause(duration: float = 1.5, pause_id: str = "") -> Clip:
     seconds = max(0.2, min(30.0, float(duration)))
-    return Clip(path="", in_point=0.0, out_point=seconds, duration=seconds, kind="pause")
+    return Clip(
+        path="",
+        in_point=0.0,
+        out_point=seconds,
+        duration=seconds,
+        id=pause_id or new_id(),
+        kind="pause",
+    )
 
 
-def insert_pause(clips: list[Clip], at: float, duration: float = 1.5) -> list[Clip]:
+def insert_pause(
+    clips: list[Clip], at: float, duration: float = 1.5, pause_id: str = ""
+) -> list[Clip]:
     """Split the clip under ``at`` and place a freeze between the two pieces.
 
     Narration times are left alone. Only the picture track grows.
+    ``at`` is a time on ``clips`` as they stand now, before this pause is inserted.
     """
     if not clips:
         return clips
@@ -96,26 +106,181 @@ def insert_pause(clips: list[Clip], at: float, duration: float = 1.5) -> list[Cl
         clip.duration = clip.out_point
         clip.in_point = 0.0
         return clips
-    pause = make_pause(duration)
+    pause = make_pause(duration, pause_id)
     start = clip_joined_start(clips, index)
     into = at - start
     if into <= 0.05:
         return clips[:index] + [pause] + clips[index:]
     if into >= clip.used - 0.05:
         return clips[: index + 1] + [pause] + clips[index + 1 :]
-    pieces = split_clip(clips, index, clip.in_point + into)
+    pieces = split_clip(clips, index, clip.in_point + into, keep_origin=True)
     if len(pieces) == len(clips):
         return clips[: index + 1] + [pause] + clips[index + 1 :]
     return pieces[: index + 1] + [pause] + pieces[index + 1 :]
 
 
-def split_clip(clips: list[Clip], index: int, at_local_time: float) -> list[Clip]:
+def split_clip(
+    clips: list[Clip], index: int, at_local_time: float, keep_origin: bool = False
+) -> list[Clip]:
     clip = clips[index]
     if at_local_time <= clip.in_point + 0.05 or at_local_time >= clip.out_point - 0.05:
         return clips
-    left = replace(clip, id=new_id(), out_point=at_local_time)
-    right = replace(clip, id=new_id(), in_point=at_local_time)
+    origin = (clip.source_id or clip.id) if keep_origin else ""
+    left = replace(clip, id=new_id(), out_point=at_local_time, source_id=origin)
+    right = replace(clip, id=new_id(), in_point=at_local_time, source_id=origin if keep_origin else "")
     return clips[:index] + [left, right] + clips[index + 1 :]
+
+
+def compose_clips(clips: list[Clip], pauses: list[Pause]) -> list[Clip]:
+    """Return ``clips`` with ``pauses`` inserted. ``at`` is a shared-video time."""
+    view = [
+        replace(clip, source_id=clip.source_id or clip.id)
+        for clip in clips
+        if not clip.is_pause
+    ]
+    ordered = sorted(pauses, key=lambda item: (-float(item.at), item.id))
+    for pause in ordered:
+        view = insert_pause(view, float(pause.at), float(pause.duration), pause.id)
+    return view
+
+
+def _same_media_cut(left: Clip, right: Clip) -> bool:
+    if left.is_pause or right.is_pause or left.kind != right.kind:
+        return False
+    if not left.path or left.path != right.path:
+        return False
+    return abs(float(left.out_point) - float(right.in_point)) <= 0.051
+
+
+def _can_join(left: Clip, right: Clip, pending_pause: bool, join_legacy: bool) -> bool:
+    if not _same_media_cut(left, right):
+        return False
+    if left.source_id and left.source_id == right.source_id:
+        return True
+    return bool(join_legacy and pending_pause and not left.source_id and not right.source_id)
+
+
+def extract_pauses(
+    clips: list[Clip], join_legacy: bool = False
+) -> tuple[list[Clip], list[Pause]]:
+    """Pull pause clips out of a composed timeline.
+
+    Pieces that a pause split apart are joined back into one shared clip.
+    Pause ``at`` values are times on that shared video.
+    """
+    source: list[Clip] = []
+    pauses: list[Pause] = []
+    source_time = 0.0
+    pending_pause = False
+    for clip in clips:
+        if clip.is_pause:
+            pause = Pause(at=source_time, duration=max(0.2, clip.used), id=clip.id)
+            pause.clamp()
+            pauses.append(pause)
+            pending_pause = True
+            continue
+        if source and _can_join(source[-1], clip, pending_pause, join_legacy):
+            left = source[-1]
+            left.out_point = max(float(left.out_point), float(clip.out_point))
+            left.duration = max(float(left.duration), float(clip.duration), left.out_point)
+            if not left.source_id:
+                left.source_id = clip.source_id
+            source_time += clip.used
+            pending_pause = False
+            continue
+        pending_pause = False
+        source.append(replace(clip))
+        source_time += clip.used
+    counts: dict[str, int] = {}
+    for clip in source:
+        key = clip.source_id or clip.id
+        counts[key] = counts.get(key, 0) + 1
+    restored: list[Clip] = []
+    for clip in source:
+        if clip.source_id and counts.get(clip.source_id, 0) == 1:
+            restored.append(replace(clip, id=clip.source_id, source_id=""))
+        else:
+            restored.append(replace(clip, source_id=""))
+    return restored, pauses
+
+
+def locate_source_frame(old_clips: list[Clip], new_clips: list[Clip], moment: float) -> float | None:
+    """Where the same frame sits after the shared video is trimmed or reordered."""
+    mapped = map_joined_to_clip(old_clips, moment)
+    if mapped is None:
+        return None
+    clip, local, _index = mapped
+
+    def _place(matches_id: bool) -> float | None:
+        acc = 0.0
+        for new in new_clips:
+            same = new.id == clip.id if matches_id else (
+                bool(clip.path)
+                and new.path == clip.path
+                and new.kind == clip.kind
+                and new.id != clip.id
+            )
+            if same and new.in_point - 0.03 <= local <= new.out_point + 0.03:
+                offset = min(max(0.0, local - new.in_point), new.used)
+                return acc + offset
+            acc += new.used
+        return None
+
+    if any(new.id == clip.id for new in new_clips):
+        return _place(True)
+    return _place(False)
+
+
+def same_source_clips(old_clips: list[Clip], new_clips: list[Clip]) -> bool:
+    if len(old_clips) != len(new_clips):
+        return False
+    for left, right in zip(old_clips, new_clips):
+        if left.id != right.id or left.path != right.path or left.kind != right.kind:
+            return False
+        if abs(float(left.in_point) - float(right.in_point)) > 0.01:
+            return False
+        if abs(float(left.out_point) - float(right.out_point)) > 0.01:
+            return False
+    return True
+
+
+def remap_source_regions(
+    old_clips: list[Clip], new_clips: list[Clip], regions: list[BlurRegion]
+) -> list[BlurRegion]:
+    moved: list[BlurRegion] = []
+    for region in regions:
+        start = locate_source_frame(old_clips, new_clips, region.start)
+        end = locate_source_frame(old_clips, new_clips, region.end)
+        if start is None and end is None:
+            continue
+        if start is None:
+            start = end
+        if end is None:
+            end = start
+        if start is None or end is None:
+            continue
+        if end < start:
+            start, end = end, start
+        if end < start + 0.08:
+            end = start + 0.08
+        updated = replace(region, start=start, end=end)
+        updated.clamp()
+        moved.append(updated)
+    return moved
+
+
+def remap_source_pauses(
+    old_clips: list[Clip], new_clips: list[Clip], pauses: list[Pause]
+) -> list[Pause]:
+    moved: list[Pause] = []
+    for pause in pauses:
+        at = locate_source_frame(old_clips, new_clips, pause.at)
+        if at is None:
+            continue
+        updated = replace(pause, at=at)
+        updated.clamp()
+        moved.append(updated)
+    return moved
 
 
 def move_clip(clips: list[Clip], index: int, delta: int) -> list[Clip]:
