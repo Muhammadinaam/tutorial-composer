@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from app.engine.project import BlurRegion
+from app.engine.zoom import zoom_crop
 
 
 class PreviewCanvas(QWidget):
@@ -25,6 +26,7 @@ class PreviewCanvas(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._mode = "empty"
         self._image: QImage | None = None
+        self._frame_dirty = False
         self._placeholder = "Add a video or image to the timeline"
         self._regions: list[BlurRegion] = []
         self._selected_id = ""
@@ -60,18 +62,28 @@ class PreviewCanvas(QWidget):
         self._placeholder = ""
         self.update()
 
+    def frame_pending(self) -> bool:
+        """True while a frame is waiting to be painted. Later frames can be dropped."""
+        return self._frame_dirty
+
     def set_frame(self, image: QImage) -> None:
         if image.isNull():
             return
         self._mode = "video"
         self._placeholder = ""
         self._image = image
+        self._frame_dirty = True
         self.update()
 
     def set_draw_mode(self, enabled: bool, kind: str = "blur") -> None:
         self._draw_mode = bool(enabled)
         if enabled:
-            self._draw_kind = "highlight" if kind == "highlight" else "blur"
+            if kind == "highlight":
+                self._draw_kind = "highlight"
+            elif kind == "zoom":
+                self._draw_kind = "zoom"
+            else:
+                self._draw_kind = "blur"
         if self._drag is None:
             self.setCursor(Qt.CursorShape.CrossCursor if self._draw_mode else Qt.CursorShape.ArrowCursor)
         self.update()
@@ -102,24 +114,63 @@ class PreviewCanvas(QWidget):
     def _covers(self, blur: BlurRegion) -> bool:
         return float(blur.start) - 0.001 <= self._playhead <= float(blur.end) + 0.001
 
+    def _zoom_edit(self) -> bool:
+        """The Zoom tool shows the whole frame so the box can be drawn and resized."""
+        return self._draw_mode and self._draw_kind == "zoom"
+
+    def _crop_pixels(self) -> tuple[float, float, float, float]:
+        width, height = self._frame_size()
+        if self._image is None or self._image.isNull() or self._zoom_edit():
+            return 0.0, 0.0, float(width), float(height)
+        return zoom_crop(
+            [region for region in self._regions if region.is_zoom()],
+            self._playhead,
+            width,
+            height,
+        )
+
+    def _view_norm(self, blur: BlurRegion) -> tuple[float, float, float, float]:
+        crop_x, crop_y, crop_w, crop_h = self._crop_pixels()
+        width, height = self._frame_size()
+        if crop_w < 1 or crop_h < 1:
+            return blur.x, blur.y, blur.w, blur.h
+        return (
+            (blur.x * width - crop_x) / crop_w,
+            (blur.y * height - crop_y) / crop_h,
+            (blur.w * width) / crop_w,
+            (blur.h * height) / crop_h,
+        )
+
     def _widget_rect(self, blur: BlurRegion) -> QRect:
         content = self._content_rect()
+        x, y, w, h = self._view_norm(blur)
         return QRect(
-            int(content.x() + blur.x * content.width()),
-            int(content.y() + blur.y * content.height()),
-            max(1, int(blur.w * content.width())),
-            max(1, int(blur.h * content.height())),
+            int(content.x() + x * content.width()),
+            int(content.y() + y * content.height()),
+            max(1, int(w * content.width())),
+            max(1, int(h * content.height())),
         )
 
     def _to_norm(self, pos: QPoint, *, clamp: bool) -> tuple[float, float] | None:
         content = self._content_rect()
         if content.width() < 2 or content.height() < 2:
             return None
-        nx = (pos.x() - content.x()) / content.width()
-        ny = (pos.y() - content.y()) / content.height()
-        if not clamp and (nx < -0.02 or ny < -0.02 or nx > 1.02 or ny > 1.02):
+        vx = (pos.x() - content.x()) / content.width()
+        vy = (pos.y() - content.y()) / content.height()
+        if not clamp and (vx < -0.02 or vy < -0.02 or vx > 1.02 or vy > 1.02):
             return None
-        return max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny))
+        vx = max(0.0, min(1.0, vx))
+        vy = max(0.0, min(1.0, vy))
+        crop_x, crop_y, crop_w, crop_h = self._crop_pixels()
+        width, height = self._frame_size()
+        sx = (crop_x + vx * crop_w) / width
+        sy = (crop_y + vy * crop_h) / height
+        return max(0.0, min(1.0, sx)), max(0.0, min(1.0, sy))
+
+    def _hit_enabled(self, blur: BlurRegion) -> bool:
+        if blur.is_zoom():
+            return self._zoom_edit()
+        return True
 
     def _blur_by_id(self, blur_id: str) -> BlurRegion | None:
         for blur in self._regions:
@@ -146,12 +197,12 @@ class PreviewCanvas(QWidget):
 
     def _region_at(self, pos: QPoint) -> tuple[BlurRegion, str] | None:
         selected = self._blur_by_id(self._selected_id)
-        if selected is not None:
+        if selected is not None and self._hit_enabled(selected):
             zone = self._zone_on(selected, pos, handles=True)
             if zone:
                 return selected, zone
         for blur in reversed(self._regions):
-            if blur is selected or not self._covers(blur):
+            if blur is selected or not self._covers(blur) or not self._hit_enabled(blur):
                 continue
             zone = self._zone_on(blur, pos, handles=False)
             if zone:
@@ -160,13 +211,19 @@ class PreviewCanvas(QWidget):
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self._frame_dirty = False
         painter.fillRect(self.rect(), QColor("#111214"))
         content = self._content_rect()
+        if content.width() > 1 and content.height() > 1:
+            painter.save()
+            painter.setClipRect(content)
         if self._image is not None and not self._image.isNull() and content.width() > 1:
-            painter.drawImage(content, self._image)
+            crop_x, crop_y, crop_w, crop_h = self._crop_pixels()
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            painter.drawImage(QRectF(content), self._image, QRectF(crop_x, crop_y, crop_w, crop_h))
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
             for blur in self._regions:
-                if self._covers(blur) and not blur.is_highlight():
+                if self._covers(blur) and not blur.is_highlight() and not blur.is_zoom():
                     self._paint_blur(painter, blur)
         elif self._placeholder:
             painter.setPen(QColor("#8b9098"))
@@ -174,14 +231,24 @@ class PreviewCanvas(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._placeholder)
         for blur in self._regions:
             selected = blur.id == self._selected_id
+            if blur.is_zoom() and not self._zoom_edit():
+                continue
             if not selected and not self._covers(blur):
                 continue
             rect = self._widget_rect(blur)
             highlight = blur.is_highlight()
+            zoom = blur.is_zoom()
             if selected and not self._covers(blur):
-                painter.fillRect(rect, QColor(255, 59, 48, 40) if highlight else QColor(160, 90, 220, 40))
+                if zoom:
+                    painter.fillRect(rect, QColor(40, 208, 216, 40))
+                elif highlight:
+                    painter.fillRect(rect, QColor(255, 59, 48, 40))
+                else:
+                    painter.fillRect(rect, QColor(160, 90, 220, 40))
             if highlight:
                 pen = QPen(QColor("#ffffff") if selected else QColor("#ff3b30"), 4)
+            elif zoom:
+                pen = QPen(QColor("#ffffff") if selected else QColor("#3ad0d8"), 3)
             else:
                 pen = QPen(QColor("#ffffff") if selected else QColor("#d2b4ff"), 2 if selected else 1)
             if selected and not self._covers(blur):
@@ -211,11 +278,16 @@ class PreviewCanvas(QWidget):
             if self._draw_kind == "highlight":
                 painter.fillRect(rect, QColor(255, 59, 48, 40))
                 painter.setPen(QPen(QColor("#ff3b30"), 3, Qt.PenStyle.DashLine))
+            elif self._draw_kind == "zoom":
+                painter.fillRect(rect, QColor(40, 208, 216, 50))
+                painter.setPen(QPen(QColor("#3ad0d8"), 3, Qt.PenStyle.DashLine))
             else:
                 painter.fillRect(rect, QColor(160, 90, 220, 70))
                 painter.setPen(QPen(QColor("#ffffff"), 1, Qt.PenStyle.DashLine))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        if content.width() > 1 and content.height() > 1:
+            painter.restore()
 
     def _handle_rects(self, rect: QRect) -> list[QRect]:
         size = 8

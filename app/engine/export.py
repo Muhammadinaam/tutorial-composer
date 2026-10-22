@@ -7,6 +7,7 @@ from app.engine.edl import joined_duration, target_video_size
 from app.engine.ffmpeg import media_info, run
 from app.engine.project import BlurRegion, Clip, Project, clamp_speed
 from app.engine.timeline import Hold, TimelinePlan
+from app.engine.zoom import zoom_filter_script
 
 
 YOUTUBE_ARGS = [
@@ -367,7 +368,7 @@ def blur_filter_script(blurs: list[BlurRegion], width: int, height: int, duratio
     current = "0:v"
     placed = 0
     for blur in blurs:
-        if blur.end - blur.start < 0.05 or blur.w <= 0.01 or blur.h <= 0.01:
+        if blur.is_zoom() or blur.end - blur.start < 0.05 or blur.w <= 0.01 or blur.h <= 0.01:
             continue
         pixels = blur_pixels(blur, width, height)
         if not pixels:
@@ -430,6 +431,51 @@ def apply_blurs(source: Path, blurs: list[BlurRegion], dest: Path, on_progress=N
         str(source),
         "-filter_complex",
         script_body.replace("\n", ""),
+        "-map",
+        "[vout]",
+    ]
+    if info["has_audio"]:
+        cmd.extend(["-map", "0:a", "-c:a", "aac", "-b:a", "192k"])
+    else:
+        cmd.append("-an")
+    cmd.extend(
+        [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            str(dest),
+            "-y",
+        ]
+    )
+    run(cmd, on_progress=on_progress, duration=duration)
+    return dest
+
+
+def apply_zooms(source: Path, zooms: list[BlurRegion], dest: Path, on_progress=None) -> Path:
+    info = media_info(source)
+    width = int(info["width"] or 0)
+    height = int(info["height"] or 0)
+    duration = max(float(info["duration"] or 0.0), 0.1)
+    script_body = zoom_filter_script(zooms, width, height)
+    if not script_body:
+        if source.resolve() != dest.resolve():
+            shutil.copy2(source, dest)
+        if on_progress:
+            on_progress(1.0)
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    script_path = dest.with_suffix(".zoom.txt")
+    script_path.write_text(script_body, encoding="utf-8")
+    cmd = [
+        "-i",
+        str(source),
+        "-filter_complex_script",
+        str(script_path),
         "-map",
         "[vout]",
     ]
@@ -713,6 +759,8 @@ def export_project(
     )
     picture = joined
     blurs = project.regions()
+    zooms = project.zooms()
+    blur_end = 0.40 if zooms else 0.44
     if blurs:
         emit("Blurring regions…", percent_start + span * 0.28)
         picture = work / "blurred.mp4"
@@ -720,15 +768,27 @@ def export_project(
             joined,
             blurs,
             picture,
-            on_progress=hook("Blurring regions", 0.28, 0.44),
+            on_progress=hook("Blurring regions", 0.28, blur_end),
         )
-    emit("Inserting freeze frames…", percent_start + span * 0.44)
+    zoom_end = blur_end
+    if zooms:
+        zoom_end = 0.48 if blurs else 0.44
+        emit("Zooming regions…", percent_start + span * blur_end)
+        zoomed = work / "zoomed.mp4"
+        apply_zooms(
+            picture,
+            zooms,
+            zoomed,
+            on_progress=hook("Zooming regions", blur_end, zoom_end),
+        )
+        picture = zoomed
+    emit("Inserting freeze frames…", percent_start + span * zoom_end)
     held = work / "held.mp4"
     apply_holds(
         picture,
         plan.holds,
         held,
-        on_progress=hook("Inserting freeze frames", 0.44, 0.58),
+        on_progress=hook("Inserting freeze frames", zoom_end, 0.58),
     )
     picture = held
     caption_srt = work / "captions.srt"

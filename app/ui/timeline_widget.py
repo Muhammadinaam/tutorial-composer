@@ -195,6 +195,10 @@ class TimelineCanvas(QWidget):
                 painter.setBrush(QColor(230, 70, 60, 220) if selected else QColor(180, 40, 36, 190))
                 painter.setPen(QPen(QColor("#ffffff") if selected else QColor("#3a1010"), 1))
                 label = "Box"
+            elif blur.is_zoom():
+                painter.setBrush(QColor(40, 190, 200, 230) if selected else QColor(16, 130, 140, 200))
+                painter.setPen(QPen(QColor("#ffffff") if selected else QColor("#08383c"), 1))
+                label = "Zoom"
             else:
                 painter.setBrush(QColor(176, 112, 230, 210) if selected else QColor(120, 70, 180, 170))
                 painter.setPen(QPen(QColor("#ffffff") if selected else QColor("#2a1238"), 1))

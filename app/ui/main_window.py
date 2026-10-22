@@ -592,6 +592,13 @@ class MainWindow(QMainWindow):
             "Drag on the preview to draw a red box for this language. "
             "Drag the red bar on V1 to choose when it shows. Other language tabs keep their own times."
         )
+        self.zoom_btn = QPushButton("Zoom")
+        self.zoom_btn.setCheckable(True)
+        self.zoom_btn.setToolTip(
+            "Drag on the preview to draw the area that should fill the frame for this language. "
+            "The picture eases into that area while the playhead is inside the cyan bar on V1, "
+            "then eases back out. Other language tabs keep their own times."
+        )
         self.mark_in_btn = QPushButton("Mark In")
         self.mark_out_btn = QPushButton("Mark Out")
         self.blur_btn = QPushButton("Blur")
@@ -603,7 +610,7 @@ class MainWindow(QMainWindow):
         self.delete_range_btn.setToolTip("Ripple-delete the middle between yellow marks.")
         self.delete_btn = QPushButton("Delete")
         self.delete_btn.setToolTip(
-            "Remove the selected narration line, pause, blur, highlight, video, image, or music."
+            "Remove the selected narration line, pause, blur, highlight, zoom, video, image, or music."
         )
         self.undo_btn = QPushButton("Undo")
         self.undo_btn.setToolTip("Undo the last edit (Ctrl+Z)")
@@ -620,6 +627,7 @@ class MainWindow(QMainWindow):
             self.mark_out_btn,
             self.blur_btn,
             self.highlight_btn,
+            self.zoom_btn,
             self.delete_range_btn,
             self.delete_btn,
             self.undo_btn,
@@ -671,6 +679,7 @@ class MainWindow(QMainWindow):
             "Drag a video to change its order. Drag a narration line to change when it starts. "
             "Click a block, then Delete to remove it. Drag the edges of a clip to trim. "
             "A pause is a block on V1 for this language. Drag its right edge to change how long the picture holds. "
+            "A cyan Zoom bar eases the picture into a box drawn on the preview. "
             "Drag the red line, or empty track, to scrub."
         )
         tl_box.addWidget(self.timeline)
@@ -728,6 +737,7 @@ class MainWindow(QMainWindow):
         self.mark_out_btn.clicked.connect(self.mark_out)
         self.blur_btn.toggled.connect(lambda on: self._region_tool_toggled("blur", on))
         self.highlight_btn.toggled.connect(lambda on: self._region_tool_toggled("highlight", on))
+        self.zoom_btn.toggled.connect(lambda on: self._region_tool_toggled("zoom", on))
         self.delete_range_btn.clicked.connect(self.delete_marked_range)
         self.preview.gestureStarted.connect(self._preview_gesture_started)
         self.preview.gestureFinished.connect(self._on_edit_finished)
@@ -1299,7 +1309,7 @@ class MainWindow(QMainWindow):
             extra_end=self._cue_end(),
             mark_in=self.project.mark_in,
             mark_out=self.project.mark_out,
-            blurs=self.project.regions(),
+            blurs=self.project.regions() + self.project.zooms(),
             selected_blur=self._selected_blur_id,
             selected_cue=self._selected_cue,
         )
@@ -1308,9 +1318,8 @@ class MainWindow(QMainWindow):
         if clip and clip.is_pause and self._selected_blur_id == "" and self._selected_cue < 0 and not self._music_selected:
             self.selected_label.setText(f"Pause {format_timestamp(clip.used)}")
         elif blur:
-            word = "Highlight" if blur.is_highlight() else "Blur"
             self.selected_label.setText(
-                f"{word} {format_timestamp(blur.start)}–{format_timestamp(blur.end)}"
+                f"{self._region_word(blur)} {format_timestamp(blur.start)}–{format_timestamp(blur.end)}"
             )
         elif self._music_selected and self.project.music_path:
             self.selected_label.setText(f"Music: {Path(self.project.music_path).name}")
@@ -1485,38 +1494,54 @@ class MainWindow(QMainWindow):
             cue_sources.append(moved)
         highlight_sources = []
         for region in narration.highlights:
-            start = locate_source_frame(
-                old_source, new_source, composed_to_source(region.start, old_pauses)
-            )
-            end = locate_source_frame(
-                old_source, new_source, composed_to_source(region.end, old_pauses)
-            )
-            if start is None and end is None:
-                continue
-            if start is None:
-                start = end
-            if end is None:
-                end = start
-            if start is None or end is None:
-                continue
-            if end < start:
-                start, end = end, start
-            highlight_sources.append((region, start, end))
+            placed = self._source_span(region, old_source, new_source, old_pauses)
+            if placed is not None:
+                highlight_sources.append((region, placed[0], placed[1]))
+        zoom_sources = []
+        for region in narration.zooms:
+            placed = self._source_span(region, old_source, new_source, old_pauses)
+            if placed is not None:
+                zoom_sources.append((region, placed[0], placed[1]))
         narration.pauses = remap_source_pauses(old_source, new_source, old_pauses)
         narration.cues = [
             replace(cue, video_time=source_to_composed(moment, narration.pauses))
             for cue, moment in zip(kept_cues, cue_sources)
         ]
-        highlights = []
-        for region, start, end in highlight_sources:
-            view_start = source_to_composed(start, narration.pauses)
-            view_end = source_to_composed(end, narration.pauses)
+        narration.highlights = self._view_spans(highlight_sources, narration.pauses)
+        narration.zooms = self._view_spans(zoom_sources, narration.pauses)
+
+    def _source_span(self, region: BlurRegion, old_source: list, new_source: list, old_pauses) -> tuple[float, float] | None:
+        from app.engine.edl import locate_source_frame
+
+        start = locate_source_frame(
+            old_source, new_source, composed_to_source(region.start, old_pauses)
+        )
+        end = locate_source_frame(
+            old_source, new_source, composed_to_source(region.end, old_pauses)
+        )
+        if start is None and end is None:
+            return None
+        if start is None:
+            start = end
+        if end is None:
+            end = start
+        if start is None or end is None:
+            return None
+        if end < start:
+            start, end = end, start
+        return start, end
+
+    def _view_spans(self, placed: list[tuple[BlurRegion, float, float]], pauses) -> list[BlurRegion]:
+        viewed = []
+        for region, start, end in placed:
+            view_start = source_to_composed(start, pauses)
+            view_end = source_to_composed(end, pauses)
             if view_end < view_start + 0.08:
                 view_end = view_start + 0.08
             updated = replace(region, start=view_start, end=view_end)
             updated.clamp()
-            highlights.append(updated)
-        narration.highlights = highlights
+            viewed.append(updated)
+        return viewed
 
     def _ripple_other_languages(self, src_lo: float, src_hi: float) -> None:
         if src_hi - src_lo < 0.05:
@@ -1532,6 +1557,9 @@ class MainWindow(QMainWindow):
             )
             narration.highlights = self._ripple_highlights_on_source(
                 narration.highlights, old_pauses, narration.pauses, src_lo, src_hi
+            )
+            narration.zooms = self._ripple_highlights_on_source(
+                narration.zooms, old_pauses, narration.pauses, src_lo, src_hi
             )
 
     def _ripple_cues_on_source(self, cues, old_pauses, new_pauses, src_lo: float, src_hi: float):
@@ -1683,6 +1711,7 @@ class MainWindow(QMainWindow):
         current = self.project.narrations.get(code) or self.project.current()
         current.cues = remap_cues(old, new, current.cues)
         current.highlights = remap_blurs(old, new, current.highlights)
+        current.zooms = remap_blurs(old, new, current.zooms)
         old_source, _old_pauses = extract_pauses(old)
         new_source, new_pauses = extract_pauses(new)
         current.pauses = new_pauses
@@ -3272,10 +3301,12 @@ class MainWindow(QMainWindow):
         if code not in self.project.narrations:
             match = matching_voice(self.voices, code)
             copied = previous.highlights if previous else []
+            copied_zooms = previous.zooms if previous else []
             self.project.narrations[code] = Narration(
                 lang=code,
                 voice=match.id if match else self.project.voice,
                 highlights=self._highlights_on_shared_frames(copied, pauses),
+                zooms=self._highlights_on_shared_frames(copied_zooms, pauses),
             )
         current = self.project.current()
         self.project.voice = current.voice
@@ -3374,36 +3405,59 @@ class MainWindow(QMainWindow):
     def _on_video_frame(self, frame) -> None:
         if self.preview.mode != "video":
             return
+        # The UI thread is still painting the last frame. Copying another
+        # 1080p image here piles up and the voice buffer gets closed mid-read.
+        if self.preview.frame_pending():
+            return
         image = frame.toImage()
         if image.isNull():
             return
         self.preview.set_frame(image.copy())
 
     def _selected_blur(self) -> BlurRegion | None:
-        for blur in self.project.regions():
+        for blur in self.project.regions() + self.project.zooms():
             if blur.id == self._selected_blur_id:
                 return blur
         return None
 
+    def _region_word(self, region: BlurRegion) -> str:
+        if region.is_zoom():
+            return "Zoom"
+        if region.is_highlight():
+            return "Highlight"
+        return "Blur"
+
     def _sync_preview_overlays(self) -> None:
         if not hasattr(self, "preview"):
             return
-        self.preview.set_regions(self.project.regions(), self._selected_blur_id, self.playhead)
+        self.preview.set_regions(
+            self.project.regions() + self.project.zooms(),
+            self._selected_blur_id,
+            self.playhead,
+        )
 
     def _region_tool_toggled(self, which: str, on: bool) -> None:
-        other = self.highlight_btn if which == "blur" else self.blur_btn
-        if on and other.isChecked():
-            other.blockSignals(True)
-            other.setChecked(False)
-            other.blockSignals(False)
-        drawing = self.blur_btn.isChecked() or self.highlight_btn.isChecked()
-        kind = "highlight" if self.highlight_btn.isChecked() else "blur"
+        tools = {
+            "blur": self.blur_btn,
+            "highlight": self.highlight_btn,
+            "zoom": self.zoom_btn,
+        }
+        if on:
+            for name, button in tools.items():
+                if name != which and button.isChecked():
+                    button.blockSignals(True)
+                    button.setChecked(False)
+                    button.blockSignals(False)
+        drawing = any(button.isChecked() for button in tools.values())
+        kind = next((name for name, button in tools.items() if button.isChecked()), "blur")
         self.preview.set_draw_mode(drawing, kind)
         if not drawing:
             self._set_status("Draw tool off.")
             return
         if kind == "highlight":
             self._set_status("Drag on the preview to draw a red box.")
+        elif kind == "zoom":
+            self._set_status("Drag on the preview to draw the area that should fill the frame.")
         else:
             self._set_status("Drag on the preview to blur part of the picture.")
 
@@ -3414,7 +3468,7 @@ class MainWindow(QMainWindow):
     def _add_blur_from_draw(self, x: float, y: float, w: float, h: float) -> None:
         total = joined_duration(self.project.clips)
         if total <= 0:
-            self._set_status("Add a video before drawing a blur.")
+            self._set_status("Add a video before drawing on the preview.")
             return
         mark_in = self.project.mark_in
         mark_out = self.project.mark_out
@@ -3431,7 +3485,12 @@ class MainWindow(QMainWindow):
             else:
                 end = total
                 start = max(0.0, end - 0.08)
-        kind = "highlight" if self.highlight_btn.isChecked() else "blur"
+        if self.zoom_btn.isChecked():
+            kind = "zoom"
+        elif self.highlight_btn.isChecked():
+            kind = "highlight"
+        else:
+            kind = "blur"
         region = BlurRegion(start=start, end=end, x=x, y=y, w=w, h=h, kind=kind)
         region.clamp()
         region.end = min(total, region.end)
@@ -3440,6 +3499,8 @@ class MainWindow(QMainWindow):
         shown_start, shown_end = region.start, region.end
         if region.is_highlight():
             self.project.current().highlights.append(region)
+        elif region.is_zoom():
+            self.project.current().zooms.append(region)
         else:
             pauses = self.project.current().pauses
             region.start = composed_to_source(shown_start, pauses)
@@ -3454,10 +3515,13 @@ class MainWindow(QMainWindow):
         else:
             self.refresh_timeline()
             self._sync_preview_overlays()
-        word = "Highlight" if region.is_highlight() else "Blur"
+        word = self._region_word(region)
+        follow = ""
+        if region.is_zoom():
+            follow = " Turn Zoom off to see the picture ease in."
         self._set_status(
             f"{word} from {format_timestamp(shown_start)} to {format_timestamp(shown_end)}. "
-            "Drag its bar on V1 to change the time."
+            f"Drag its bar on V1 to change the time.{follow}"
         )
 
     def _on_blur_selected(self, blur_id: str) -> None:
@@ -3522,6 +3586,9 @@ class MainWindow(QMainWindow):
         for highlight in self.project.current().highlights:
             if highlight.id == region_id:
                 return highlight
+        for zoom in self.project.current().zooms:
+            if zoom.id == region_id:
+                return zoom
         return None
 
     def _write_blur_span(self, region: BlurRegion) -> None:
@@ -3538,14 +3605,13 @@ class MainWindow(QMainWindow):
 
     def _on_blur_edited(self) -> None:
         region = self.timeline.region_by_id(self._selected_blur_id)
-        if region is not None and not region.is_highlight():
+        if region is not None and not region.is_highlight() and not region.is_zoom():
             self._write_blur_span(region)
         self._sync_preview_overlays()
         blur = self._selected_blur()
         if blur:
-            word = "Highlight" if blur.is_highlight() else "Blur"
             self.selected_label.setText(
-                f"{word} {format_timestamp(blur.start)}–{format_timestamp(blur.end)}"
+                f"{self._region_word(blur)} {format_timestamp(blur.start)}–{format_timestamp(blur.end)}"
             )
 
     def _blur_rect_edited(self, blur_id: str, x: float, y: float, w: float, h: float) -> None:
@@ -3562,12 +3628,19 @@ class MainWindow(QMainWindow):
             return False
         selected = self._selected_blur()
         highlight = bool(selected and selected.is_highlight())
+        zoom = bool(selected and selected.is_zoom())
         if highlight:
             before = len(self.project.current().highlights)
             self.project.current().highlights = [
                 blur for blur in self.project.current().highlights if blur.id != blur_id
             ]
             removed = len(self.project.current().highlights) != before
+        elif zoom:
+            before = len(self.project.current().zooms)
+            self.project.current().zooms = [
+                region for region in self.project.current().zooms if region.id != blur_id
+            ]
+            removed = len(self.project.current().zooms) != before
         else:
             before = len(self.project.blurs)
             self.project.blurs = [blur for blur in self.project.blurs if blur.id != blur_id]
@@ -3575,9 +3648,15 @@ class MainWindow(QMainWindow):
         self._selected_blur_id = ""
         if not removed:
             return False
+        if highlight:
+            message = "Highlight removed."
+        elif zoom:
+            message = "Zoom removed."
+        else:
+            message = "Blur removed."
         self.refresh_timeline()
         self._sync_preview_overlays()
-        self._set_status("Highlight removed." if highlight else "Blur removed.")
+        self._set_status(message)
         return True
 
     def mark_in(self) -> None:
@@ -3609,6 +3688,7 @@ class MainWindow(QMainWindow):
         current = self.project.current()
         current.cues = ripple_cues(current.cues, lo, hi)
         current.highlights = ripple_blurs(current.highlights, lo, hi)
+        current.zooms = ripple_blurs(current.zooms, lo, hi)
         _source, new_pauses = extract_pauses(self.project.clips)
         current.pauses = new_pauses
         src_lo = composed_to_source(lo, old_pauses)
@@ -3929,6 +4009,11 @@ class MainWindow(QMainWindow):
                 if existing
                 else self._highlights_on_shared_frames(source.highlights, open_pauses)
             ),
+            zooms=(
+                list(existing.zooms)
+                if existing
+                else self._highlights_on_shared_frames(source.zooms, open_pauses)
+            ),
             pauses=target_pauses,
         )
         self._clear_tts(target)
@@ -3969,6 +4054,7 @@ class MainWindow(QMainWindow):
                         item,
                         pauses=[replace(pause) for pause in item.pauses],
                         highlights=list(item.highlights),
+                        zooms=list(item.zooms),
                         cues=list(item.cues),
                     )
                     if code == self.project.lang

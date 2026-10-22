@@ -147,13 +147,16 @@ class BlurRegion:
     def is_highlight(self) -> bool:
         return self.kind == "highlight"
 
+    def is_zoom(self) -> bool:
+        return self.kind == "zoom"
+
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> BlurRegion:
         kind = str(data.get("kind") or "blur")
-        if kind not in {"blur", "highlight"}:
+        if kind not in {"blur", "highlight", "zoom"}:
             kind = "blur"
         region = cls(
             start=float(data.get("start", 0.0)),
@@ -187,6 +190,7 @@ class Narration:
     voice: str = "en-US-JennyNeural"
     cues: list[Cue] = field(default_factory=list)
     highlights: list[BlurRegion] = field(default_factory=list)
+    zooms: list[BlurRegion] = field(default_factory=list)
     pauses: list[Pause] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -195,6 +199,7 @@ class Narration:
             "voice": self.voice,
             "cues": [asdict(c) for c in self.cues],
             "highlights": [item.to_dict() for item in self.highlights],
+            "zooms": [item.to_dict() for item in self.zooms],
             "pauses": [item.to_dict() for item in self.pauses],
         }
 
@@ -204,7 +209,15 @@ class Narration:
         highlights = []
         for raw in data.get("highlights") or []:
             if isinstance(raw, dict):
-                highlights.append(BlurRegion.from_dict(raw))
+                region = BlurRegion.from_dict(raw)
+                region.kind = "highlight"
+                highlights.append(region)
+        zooms = []
+        for raw in data.get("zooms") or []:
+            if isinstance(raw, dict):
+                region = BlurRegion.from_dict(raw)
+                region.kind = "zoom"
+                zooms.append(region)
         pauses = []
         for raw in data.get("pauses") or []:
             if isinstance(raw, dict):
@@ -214,6 +227,7 @@ class Narration:
             voice=data.get("voice", "en-US-JennyNeural"),
             cues=cues,
             highlights=highlights,
+            zooms=zooms,
             pauses=pauses,
         )
 
@@ -268,6 +282,13 @@ class Project:
             viewed.append(replace(blur, start=start, end=end))
         viewed.extend(self.current().highlights)
         return viewed
+
+    def zooms(self) -> list[BlurRegion]:
+        """Zoom regions on the open language's timeline.
+
+        Times already include this tab's pauses, the same way highlights do.
+        """
+        return list(self.current().zooms)
 
     def sync_from_current(self) -> None:
         current = self.current()
@@ -337,7 +358,7 @@ class Project:
             region = BlurRegion.from_dict(raw)
             if region.is_highlight():
                 legacy_highlights.append(region)
-            else:
+            elif not region.is_zoom():
                 blurs.append(region)
         if legacy_highlights and narrations and not any(item.highlights for item in narrations.values()):
             owner = narrations.get(lang) or next(iter(narrations.values()))

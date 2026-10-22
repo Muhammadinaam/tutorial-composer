@@ -5,7 +5,7 @@ import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QUrl, Signal
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QTimer, QUrl, Signal
 from PySide6.QtMultimedia import QAudio, QAudioFormat, QAudioSink
 
 
@@ -102,6 +102,8 @@ class VoiceCuePlayer(QObject):
         self._clip: CachedVoice | None = None
         self._sink: QAudioSink | None = None
         self._buffer: QBuffer | None = None
+        self._retired: list[QBuffer] = []
+        self._retire_armed = False
         self._fmt_key: tuple[int, int] | None = None
         self._heard = False
         self._ignore_end = False
@@ -246,12 +248,37 @@ class VoiceCuePlayer(QObject):
         self._fmt_key = key
 
     def _halt(self) -> None:
+        retiring = self._buffer
+        self._buffer = None
         if self._sink is not None and not _audio_is(self._sink.state(), QAudio.State.StoppedState):
             self._sink.stop()
-        if self._buffer is not None:
-            self._buffer.close()
-            self._buffer.deleteLater()
-            self._buffer = None
+        if retiring is not None:
+            # stop() returns before the pull thread leaves read(). Closing the
+            # buffer here is what prints "QIODevice::read (QBuffer): device not open"
+            # and cuts the voice off.
+            self._retired.append(retiring)
+            self._schedule_release()
+
+    def _schedule_release(self) -> None:
+        if self._retire_armed or not self._retired:
+            return
+        self._retire_armed = True
+        QTimer.singleShot(30, self._release_retired)
+
+    def _release_retired(self) -> None:
+        self._retire_armed = False
+        pulling = self._sink is not None and _audio_is(self._sink.state(), QAudio.State.ActiveState)
+        if pulling:
+            self._schedule_release()
+            return
+        pending = self._retired
+        self._retired = []
+        for buffer in pending:
+            if buffer is self._buffer:
+                continue
+            if buffer.isOpen():
+                buffer.close()
+            buffer.deleteLater()
 
     def _on_state(self, state) -> None:
         if self._ignore_end:
