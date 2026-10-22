@@ -50,11 +50,33 @@ def cache_path(provider: str, voice: str, text: str, suffix: str) -> Path:
     return cache_dir() / f"{provider}_{digest}{suffix}"
 
 
-def _usable(path: Path) -> bool:
+def usable_audio(path: str | Path | None) -> bool:
+    """A narration file is reusable when it exists and is larger than a stub."""
+    if not path:
+        return False
     try:
-        return path.is_file() and path.stat().st_size > 1000
+        file = Path(path)
+        return file.is_file() and file.stat().st_size > 1000
     except OSError:
         return False
+
+
+def _usable(path: Path) -> bool:
+    return usable_audio(path)
+
+
+def _reused_line(saved_path: str, saved_duration: float) -> tuple[Path, float] | None:
+    if not usable_audio(saved_path):
+        return None
+    try:
+        duration = float(saved_duration or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0:
+        duration = wav_duration(saved_path)
+    if duration <= 0:
+        return None
+    return Path(saved_path), duration
 
 
 def is_cached(text: str, *, provider: str, voice: str) -> bool:
@@ -323,6 +345,55 @@ def synthesize_with_duration(
         elevenlabs_key=elevenlabs_key,
     )
     return path, wav_duration(path)
+
+
+def resolve_lines(
+    lines: list[tuple[str, str, float]],
+    *,
+    provider: str,
+    voice: str,
+    openai_key: str = "",
+    elevenlabs_key: str = "",
+    on_progress: Callable[[int, int], None] | None = None,
+) -> list[tuple[Path, float]]:
+    """Speak only the lines that do not already have a usable wav.
+
+    Each line is ``(text, saved_path, saved_duration)``. A saved project file
+    is returned as-is. ``on_progress`` counts every line, including reused ones.
+    """
+    total = len(lines)
+    results: list[tuple[Path, float] | None] = [None] * total
+    missing: list[tuple[int, str]] = []
+    for index, (text, saved_path, saved_duration) in enumerate(lines):
+        reused = _reused_line(saved_path, saved_duration)
+        if reused is None:
+            missing.append((index, text))
+            continue
+        results[index] = reused
+    already = total - len(missing)
+
+    def report(done: int, _total_missing: int) -> None:
+        if on_progress:
+            on_progress(already + done, total)
+
+    if missing:
+        if on_progress and already:
+            on_progress(already, total)
+        spoken = synthesize_lines(
+            [text for _index, text in missing],
+            provider=provider,
+            voice=voice,
+            openai_key=openai_key,
+            elevenlabs_key=elevenlabs_key,
+            on_progress=report,
+        )
+        for (index, _text), pair in zip(missing, spoken):
+            results[index] = pair
+    elif on_progress and total:
+        on_progress(total, total)
+    if any(item is None for item in results):
+        raise RuntimeError("Voice generation did not finish every line.")
+    return [item for item in results if item is not None]
 
 
 def synthesize_lines(

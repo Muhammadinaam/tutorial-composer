@@ -82,7 +82,7 @@ from app.engine.script import (
 from app.engine.settings import cache_dir, load_settings, save_settings
 from app.engine.timeline import TimelinePlan, build_timeline
 from app.engine.translate import LANGUAGE_NAMES, estimate_keep_terms, polish_cues, translate_cues
-from app.engine.tts import clear_voice_cache, synthesize, synthesize_lines, wav_duration
+from app.engine.tts import clear_voice_cache, resolve_lines, synthesize, usable_audio, wav_duration
 from app.engine.voices import (
     fallback_edge_voices,
     languages_from_voices,
@@ -99,6 +99,26 @@ from app.ui.timeline_widget import TimelineWidget
 from app.ui.voice_cue import VoiceCuePlayer
 from app.ui.win_hotkey import WinRecordHotkeys
 from app.ui.workers import TaskWorker
+
+
+def _blank_voice(path) -> bool:
+    """An empty slot in the voice list, not a file that went missing."""
+    if path is None:
+        return True
+    return str(path).strip() in {"", "."}
+
+
+def _restorable_voices(paths) -> bool:
+    if not paths:
+        return False
+    saw = False
+    for path in paths:
+        if _blank_voice(path):
+            continue
+        if not Path(path).is_file():
+            return False
+        saw = True
+    return saw
 
 
 def _split_voice_text(text: str, fraction: float) -> tuple[str, str] | None:
@@ -1062,23 +1082,15 @@ class MainWindow(QMainWindow):
             source = joined_duration(self.project.clips)
         return build_timeline(cues, durations, source)
 
-    def _has_generated_voices(self) -> bool:
-        cues = self._spoken_cues()
-        return bool(
-            cues
-            and self.plan
-            and len(self.tts_paths) == len(cues)
-            and all(Path(path).is_file() for path in self.tts_paths)
-        )
-
     def _cue_spans(self) -> list[tuple[float, float, str, bool]]:
-        ready = self._has_generated_voices()
         if self.plan and self.plan.cues:
+            aligned = len(self.tts_paths) == len(self.plan.cues)
             spans = []
-            for cue in self.plan.cues:
+            for index, cue in enumerate(self.plan.cues):
                 label = cue.text[:42] or "Cue"
                 if cue.should_video_stop:
                     label = f"Freeze · {label}"
+                ready = aligned and usable_audio(self.tts_paths[index])
                 spans.append((cue.video_time, max(0.4, cue.tts_duration), label, ready))
             return spans
         cues = self._spoken_cues()
@@ -1104,14 +1116,19 @@ class MainWindow(QMainWindow):
         self._cache_voice_clips()
 
     def _cache_voice_clips(self) -> None:
-        if self.tts_paths:
-            self.voice_sfx.preload(self.tts_paths)
+        ready = [path for path in self.tts_paths if usable_audio(path)]
+        if ready:
+            self.voice_sfx.preload(ready)
 
     def _attach_audio_to_cues(self) -> None:
         spoken = self._spoken_cues()
         if len(self.tts_paths) != len(spoken) or len(self.tts_durations) != len(spoken):
             return
         for cue, path, duration in zip(spoken, self.tts_paths, self.tts_durations):
+            if not usable_audio(path):
+                cue.audio_path = ""
+                cue.audio_duration = 0.0
+                continue
             cue.audio_path = str(path)
             cue.audio_duration = float(duration)
 
@@ -1120,18 +1137,25 @@ class MainWindow(QMainWindow):
             spoken = [cue for cue in narration.cues if cue.text.strip()]
             if not spoken:
                 continue
-            if not all(cue.audio_path and Path(cue.audio_path).is_file() for cue in spoken):
-                continue
-            paths = [Path(cue.audio_path) for cue in spoken]
-            durations = []
+            paths: list[Path] = []
+            durations: list[float] = []
+            found = False
             for cue in spoken:
-                duration = float(cue.audio_duration or 0.0)
-                if duration <= 0:
-                    duration = wav_duration(cue.audio_path)
-                    cue.audio_duration = duration
-                durations.append(duration)
-            plan = self._make_plan(spoken, durations)
-            self.tts_store[lang] = (paths, durations, plan)
+                if usable_audio(cue.audio_path):
+                    duration = float(cue.audio_duration or 0.0)
+                    if duration <= 0:
+                        duration = wav_duration(cue.audio_path)
+                        cue.audio_duration = duration
+                    if duration > 0:
+                        paths.append(Path(cue.audio_path))
+                        durations.append(duration)
+                        found = True
+                        continue
+                paths.append(Path())
+                durations.append(estimate_speech_seconds(cue.text))
+            if not found:
+                continue
+            self.tts_store[lang] = (paths, durations, self._make_plan(spoken, durations))
 
     def _drop_deleted_cache_audio(self) -> None:
         try:
@@ -1153,7 +1177,7 @@ class MainWindow(QMainWindow):
                     cue.audio_duration = 0.0
         for lang, stored in list(self.tts_store.items()):
             paths, _durations, _plan = stored
-            if not all(Path(path).is_file() for path in paths):
+            if any(not _blank_voice(path) and not Path(path).is_file() for path in paths):
                 self.tts_store.pop(lang, None)
 
     def _save_tts(self) -> None:
@@ -1452,7 +1476,7 @@ class MainWindow(QMainWindow):
         self.tts_store = {}
         for lang, stored in snap.get("tts", {}).items():
             paths, durations, plan = stored
-            if paths and all(Path(path).is_file() for path in paths):
+            if _restorable_voices(paths):
                 self.tts_store[lang] = (list(paths), list(durations), plan)
         self._selected_cue = -1
         self._cue_drag_cue = None
@@ -2318,10 +2342,10 @@ class MainWindow(QMainWindow):
     def _narration_url(self, index: int) -> QUrl | None:
         if index < 0 or index >= len(self.tts_paths):
             return None
-        path = Path(self.tts_paths[index])
-        if not path.is_file():
+        path = self.tts_paths[index]
+        if not usable_audio(path):
             return None
-        return QUrl.fromLocalFile(str(path.resolve()))
+        return QUrl.fromLocalFile(str(Path(path).resolve()))
 
     def _reset_narration_player(self) -> None:
         self._narration_gen += 1
@@ -2777,6 +2801,22 @@ class MainWindow(QMainWindow):
         else:
             self._sfx_play_when_ready = True
 
+    def _skip_silent_line(self, index: int) -> None:
+        """A line with no wav does not hold the playhead or freeze the picture."""
+        self._narration_finished = index
+        if self._narration_index == index:
+            self._narration_index = -1
+            self._voice_resume = None
+        frozen = self._video_frozen and self._freeze_index == index
+        held = self._waiting_for_voice or self._audio_hold
+        self._waiting_for_voice = False
+        self._audio_hold = False
+        if frozen:
+            self._end_video_freeze(resume=self._playing and not self._scrubbing)
+            return
+        if held and self._playing and not self._scrubbing:
+            self._resume_transport()
+
     def _sync_narration(self, force: bool = False) -> None:
         if self._warming or self._pause_holding:
             return
@@ -2793,6 +2833,17 @@ class MainWindow(QMainWindow):
         if due == self._narration_finished:
             due = None
         if upcoming == self._narration_finished:
+            upcoming = None
+        skipped = -1
+        while due is not None and self._narration_url(due) is None:
+            if due == skipped:
+                break
+            skipped = due
+            self._skip_silent_line(due)
+            due = self._cue_index_at(self.playhead, lead=self.NARRATION_DUE_SLACK)
+            if due == self._narration_finished:
+                due = None
+        if upcoming is not None and self._narration_url(upcoming) is None:
             upcoming = None
         audible = self._voice_is_audible()
         if (
@@ -3401,12 +3452,18 @@ class MainWindow(QMainWindow):
                 for c in holds
             )
         elif not late and not stops:
-            kind = "measured" if len(self.tts_durations) == len(cues) else "estimated"
+            measured = (
+                len(self.tts_durations) == len(cues)
+                and len(self.tts_paths) == len(cues)
+                and all(usable_audio(path) for path in self.tts_paths)
+            )
+            kind = "measured" if measured else "estimated"
             bits.append(f"No holds ({kind}). Speech fits the gaps.")
         if any(clip.is_pause for clip in self.project.clips):
             bits.append("Pauses hold the picture on V1. Spoken lines stay at their times.")
-        if self.tts_paths and len(self.tts_paths) == len(cues):
-            bits.append(f"{len(self.tts_paths)} voice clip(s) ready on the VO track.")
+        ready_count = sum(1 for path in self.tts_paths if usable_audio(path))
+        if ready_count:
+            bits.append(f"{ready_count} voice clip(s) ready on the VO track.")
         self.warning_label.setText("\n".join(bits))
 
     def preview_voice(self) -> None:
@@ -3489,7 +3546,11 @@ class MainWindow(QMainWindow):
 
         def work(progress):
             total = len(cues)
-            progress(f"Speaking cue 1 of {total}...", 0)
+            pending = sum(1 for cue in cues if not usable_audio(cue.audio_path))
+            if pending:
+                progress(f"Speaking cue 1 of {total}...", 0)
+            else:
+                progress("Using saved voice clips.", 30)
 
             def report(done: int, total_n: int) -> None:
                 pct = int(done / max(1, total_n) * 100)
@@ -3498,8 +3559,8 @@ class MainWindow(QMainWindow):
                 else:
                     progress(f"Speaking cue {done + 1} of {total_n}...", pct)
 
-            pairs = synthesize_lines(
-                [cue.text for cue in cues],
+            pairs = resolve_lines(
+                [(cue.text, cue.audio_path, cue.audio_duration) for cue in cues],
                 provider=data.get("tts_provider", "edge-tts"),
                 voice=voice,
                 openai_key=data.get("openai_api_key", ""),
@@ -3535,8 +3596,9 @@ class MainWindow(QMainWindow):
                 "Scrub the red line onto that time, then press Play."
             )
         vo = len(self.plan.cues) if self.plan else 0
+        ready = sum(1 for path in self.tts_paths if usable_audio(path))
         self._set_status(
-            f"Generated {len(self.tts_paths)} WAV voice clip(s) — {vo} block(s) on VO for "
+            f"{ready} voice clip(s) ready — {vo} block(s) on VO for "
             f"{LANGUAGE_NAMES.get(self.project.lang, self.project.lang)}.{extra}"
         )
 
@@ -3673,31 +3735,43 @@ class MainWindow(QMainWindow):
         source = joined_duration(self.project.clips)
         existing_paths = list(self.tts_paths)
         existing_durs = list(self.tts_durations)
-        need_tts = bool(cues) and (len(existing_paths) != len(cues) or len(existing_durs) != len(cues))
+        voices_ready = (
+            bool(cues)
+            and len(existing_paths) == len(cues)
+            and len(existing_durs) == len(cues)
+            and all(usable_audio(path) for path in existing_paths)
+            and all(usable_audio(cue.audio_path) for cue in cues)
+        )
+        need_tts = bool(cues) and not voices_ready and any(
+            not usable_audio(cue.audio_path) for cue in cues
+        )
 
         def work(progress):
-            paths = existing_paths
-            durations = existing_durs
             voice_end = 18 if need_tts else 0
-            if need_tts:
+            if not cues:
+                paths, durations = [], []
+            elif voices_ready:
+                paths, durations = existing_paths, existing_durs
+            else:
                 def report(done: int, total_n: int) -> None:
-                    pct = int(done / max(1, total_n) * voice_end)
+                    pct = int(done / max(1, total_n) * voice_end) if voice_end else 100
                     if done >= total_n:
-                        progress(f"Finished {done} of {total_n} cues.", voice_end)
+                        progress(f"Finished {done} of {total_n} cues.", voice_end or 100)
                     else:
                         progress(f"Speaking cue {done + 1} of {total_n}...", pct)
 
-                pairs = synthesize_lines(
-                    [cue.text for cue in cues],
+                pairs = resolve_lines(
+                    [(cue.text, cue.audio_path, cue.audio_duration) for cue in cues],
                     provider=data.get("tts_provider", "edge-tts"),
                     voice=voice,
                     openai_key=data.get("openai_api_key", ""),
                     elevenlabs_key=data.get("elevenlabs_api_key", ""),
-                    on_progress=report,
+                    on_progress=report if need_tts else None,
                 )
                 paths = [path for path, _duration in pairs]
                 durations = [duration for _path, duration in pairs]
-                progress("Voices ready. Rendering video…", voice_end)
+                if need_tts:
+                    progress("Voices ready. Rendering video…", voice_end)
             plan = self._make_plan(cues, durations, source) if cues else self._make_plan([], [], source)
             progress("Rendering video with FFmpeg...", voice_end)
             export_project(
@@ -3775,7 +3849,7 @@ class MainWindow(QMainWindow):
         self.highlight_btn.setChecked(False)
         self._adopt_saved_voices()
         self.refresh_all()
-        ready = len(self.tts_paths)
+        ready = sum(1 for path in self.tts_paths if usable_audio(path))
         if ready:
             self._set_status(f"Opened {Path(path).name} with {ready} saved voice clip(s).")
         else:
