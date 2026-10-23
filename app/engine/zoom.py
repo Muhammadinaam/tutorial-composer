@@ -122,11 +122,66 @@ def _lerp_expr(amount: str, start: str, end: str) -> str:
     return f"((1-({amount}))*({start})+({amount})*({end}))"
 
 
-def zoom_filter_script(regions: list[BlurRegion], width: int, height: int) -> str:
+def _animated_crop_exprs(
+    zooms: list[BlurRegion], width: int, height: int
+) -> tuple[str, str, str, str]:
+    """Source-pixel crop expressions that follow :func:`zoom_crop`.
+
+    The numbers are constants. ``in_w`` must not appear here: the same text is
+    evaluated both while scaling the original frame and while cropping the
+    enlarged one, and ``in_w`` means a different picture in each filter.
+    """
+    frame_w = f"{float(width):.6f}"
+    frame_h = f"{float(height):.6f}"
+    cx = "0"
+    cy = "0"
+    cw = frame_w
+    ch = frame_h
+    for region in zooms:
+        amount = _ease_expr(region)
+        target_x, target_y, target_w, target_h = target_crop(region, width, height)
+        next_cw = f"min({frame_w},max(1,{_lerp_expr(amount, frame_w, f'{target_w:.6f}')}))"
+        next_ch = f"min({frame_h},max(1,{_lerp_expr(amount, frame_h, f'{target_h:.6f}')}))"
+        next_cx = (
+            f"max(0,min({frame_w}-({next_cw}),{_lerp_expr(amount, '0', f'{target_x:.6f}')}))"
+        )
+        next_cy = (
+            f"max(0,min({frame_h}-({next_ch}),{_lerp_expr(amount, '0', f'{target_y:.6f}')}))"
+        )
+        active = f"gt({amount},0.000001)"
+        cx = f"if({active},{next_cx},{cx})"
+        cy = f"if({active},{next_cy},{cy})"
+        cw = f"if({active},{next_cw},{cw})"
+        ch = f"if({active},{next_ch},{ch})"
+    return cx, cy, cw, ch
+
+
+def _escape_filter_expr(expr: str) -> str:
+    """Keep commas inside a filtergraph expression from splitting filters."""
+    return expr.replace("\\", "\\\\").replace(",", "\\,")
+
+
+def _rate_arg(fps: float) -> str:
+    rate = float(fps or 0.0)
+    if rate < 1:
+        rate = 30.0
+    nearest = round(rate)
+    if abs(rate - nearest) < 0.015:
+        return str(int(nearest))
+    return f"{rate:.5f}"
+
+
+def zoom_filter_script(
+    regions: list[BlurRegion], width: int, height: int, fps: float = 30.0
+) -> str:
     """FFmpeg filtergraph from ``[0:v]`` to ``[vout]``, or "" when there is no zoom.
 
-    Commas inside the crop expressions are escaped so the filtergraph parser
-    keeps each expression intact.
+    Crop remembers the size of its first input and will not look past it, and
+    its width and height cannot change over time. The frame is scaled on every
+    frame until the preview's crop fills the output, laid on a fixed black
+    canvas, and the output window is cut from that canvas. One scale factor is
+    used on both axes so the framed area stays on the same point the preview
+    shows.
     """
     zooms = sorted(
         (item for item in regions if item.is_zoom() and float(item.end) > float(item.start)),
@@ -134,27 +189,32 @@ def zoom_filter_script(regions: list[BlurRegion], width: int, height: int) -> st
     )
     if not zooms or width < 2 or height < 2:
         return ""
-    x_expr = "0"
-    y_expr = "0"
-    w_expr = "in_w"
-    h_expr = "in_h"
-    for region in zooms:
-        amount = _ease_expr(region)
-        target_x, target_y, target_w, target_h = target_crop(region, width, height)
-        x_expr = f"if(gt({amount},0),{_lerp_expr(amount, '0', f'{target_x:.4f}')},{x_expr})"
-        y_expr = f"if(gt({amount},0),{_lerp_expr(amount, '0', f'{target_y:.4f}')},{y_expr})"
-        w_expr = f"if(gt({amount},0),{_lerp_expr(amount, 'in_w', f'{target_w:.4f}')},{w_expr})"
-        h_expr = f"if(gt({amount},0),{_lerp_expr(amount, 'in_h', f'{target_h:.4f}')},{h_expr})"
-    x_expr = f"max(0,min(in_w-out_w,{x_expr}))"
-    y_expr = f"max(0,min(in_h-out_h,{y_expr}))"
-    w_expr = f"min(in_w,max(2,{w_expr}))"
-    h_expr = f"min(in_h,max(2,{h_expr}))"
-
-    def escaped(expr: str) -> str:
-        return expr.replace(",", "\\,")
-
+    cx, cy, cw, _ch = _animated_crop_exprs(zooms, width, height)
+    out_w = int(width)
+    out_h = int(height)
+    # The strongest zoom is the largest picture we have to hold. A few extra
+    # pixels cover rounding, and even sizes stay valid for yuv420p later.
+    tightest = min(target_crop(region, out_w, out_h)[2] for region in zooms)
+    tightest = max(1.0, tightest)
+    max_w = int(out_w * float(out_w) / tightest + 8)
+    max_h = int(out_w * float(out_h) / tightest + 8)
+    if max_w % 2:
+        max_w += 1
+    if max_h % 2:
+        max_h += 1
+    # One factor, out_w/cw, enlarges both axes. in_w and in_h are the source frame.
+    scale_w = f"min({max_w},max({out_w},floor(({out_w})*in_w/({cw})+0.5)))"
+    scale_h = f"min({max_h},max({out_h},floor(({out_w})*in_h/({cw})+0.5)))"
+    # in_w/in_h here are the fixed canvas, which does not change size.
+    out_x = f"max(0,min(in_w-{out_w},floor(({cx})*({out_w})/({cw})+0.5)))"
+    out_y = f"max(0,min(in_h-{out_h},floor(({cy})*({out_w})/({cw})+0.5)))"
+    rate = _rate_arg(fps)
     return (
-        "[0:v]format=gbrp,"
-        f"crop=w='{escaped(w_expr)}':h='{escaped(h_expr)}':x='{escaped(x_expr)}':y='{escaped(y_expr)}',"
-        f"scale={int(width)}:{int(height)}:flags=lanczos,format=yuv420p[vout]"
+        f"color=c=black:s={max_w}x{max_h}:r={rate},format=gbrp[bg];"
+        "[0:v]format=gbrp,setsar=1,"
+        f"scale=w='{_escape_filter_expr(scale_w)}':h='{_escape_filter_expr(scale_h)}'"
+        ":eval=frame:flags=lanczos+accurate_rnd[fg];"
+        "[bg][fg]overlay=0:0:shortest=1:format=auto,"
+        f"crop=w={out_w}:h={out_h}:x='{_escape_filter_expr(out_x)}':y='{_escape_filter_expr(out_y)}'"
+        ":exact=1,setsar=1,format=yuv420p[vout]"
     )

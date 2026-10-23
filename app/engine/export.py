@@ -461,7 +461,7 @@ def apply_zooms(source: Path, zooms: list[BlurRegion], dest: Path, on_progress=N
     width = int(info["width"] or 0)
     height = int(info["height"] or 0)
     duration = max(float(info["duration"] or 0.0), 0.1)
-    script_body = zoom_filter_script(zooms, width, height)
+    script_body = zoom_filter_script(zooms, width, height, fps=float(info["fps"] or 30.0))
     if not script_body:
         if source.resolve() != dest.resolve():
             shutil.copy2(source, dest)
